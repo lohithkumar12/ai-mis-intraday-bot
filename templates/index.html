@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI MIS Intraday Dashboard — India NSE</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v=84b88cf2">
+</head>
+<body>
+    <div class="app-container">
+        <header class="navbar">
+            <div class="logo">
+                <i class="fa-solid fa-robot logo-icon"></i>
+                <div class="logo-text">
+                    <h1>AI MIS Intraday</h1>
+                    <span class="sub" id="header-sub">India MIS / INTRADAY Engine</span>
+                </div>
+            </div>
+
+            <div class="market-tabs">
+                <button class="tab-btn active" id="tab-india" onclick="switchMarket('INDIA')">
+                    🇮🇳 India (NSE)
+                </button>
+                <button class="tab-btn" id="tab-us" onclick="switchMarket('US')">
+                    🇺🇸 US (Dhan Global)
+                </button>
+            </div>
+
+            <div class="nav-badges">
+                <div class="badge mode-badge" id="mode-badge">
+                    <i class="fa-solid fa-shield-halved"></i> <span id="mode-text">Paper / Algo</span>
+                </div>
+                <div class="badge market-badge" id="market-badge">
+                    <i class="fa-solid fa-circle-dot"></i> <span id="market-status">Checking...</span>
+                </div>
+                <div class="badge status-badge" id="kill-switch-badge">
+                    <i class="fa-solid fa-circle-check"></i> <span id="system-status">System Normal</span>
+                </div>
+                <div class="badge mode-badge" id="health-badge">
+                    <i class="fa-solid fa-heart-pulse"></i> <span id="health-text">Health…</span>
+                </div>
+            </div>
+
+            <div class="nav-actions">
+                <button class="btn btn-danger" id="kill-switch-btn" onclick="toggleKillSwitch()">
+                    <i class="fa-solid fa-power-off"></i> Kill Switch
+                </button>
+            </div>
+        </header>
+
+        <main class="dashboard-grid">
+            <section class="kpi-row">
+                <div class="kpi-card">
+                    <div class="kpi-icon blue"><i class="fa-solid fa-wallet"></i></div>
+                    <div class="kpi-info">
+                        <span class="kpi-label" id="kpi-equity-label">Portfolio Equity</span>
+                        <h2 class="kpi-value" id="equity-val">$0.00</h2>
+                        <span class="kpi-sub" id="equity-sub">Prev: $0.00</span>
+                    </div>
+                </div>
+
+                <div class="kpi-card">
+                    <div class="kpi-icon" id="pl-icon-bg"><i class="fa-solid fa-chart-line" id="pl-icon"></i></div>
+                    <div class="kpi-info">
+                        <span class="kpi-label" id="kpi-pl-label">Today's P&L</span>
+                        <h2 class="kpi-value" id="daily-pl-val">$0.00</h2>
+                        <span class="kpi-badge" id="daily-pl-pct">0.00%</span>
+                    </div>
+                </div>
+
+                <div class="kpi-card">
+                    <div class="kpi-icon green"><i class="fa-solid fa-bolt"></i></div>
+                    <div class="kpi-info">
+                        <span class="kpi-label" id="kpi-bp-label">Buying Power</span>
+                        <h2 class="kpi-value" id="buying-power-val">$0.00</h2>
+                        <span class="kpi-sub" id="cash-val">Cash: $0.00</span>
+                    </div>
+                </div>
+
+                <div class="kpi-card">
+                    <div class="kpi-icon purple"><i class="fa-solid fa-layer-group"></i></div>
+                    <div class="kpi-info">
+                        <span class="kpi-label">Active Positions</span>
+                        <h2 class="kpi-value" id="positions-count">0</h2>
+                        <span class="kpi-sub" id="kpi-universe-sub">Universe: Nifty Large-Caps (Dhan / NSE)</span>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel">
+                <div class="panel-header">
+                    <h3 id="scanner-title"><i class="fa-solid fa-radar"></i> Strategy Scanner (NSE)</h3>
+                    <span class="timestamp-label" id="last-updated">Updating...</span>
+                </div>
+                <div class="scanner-grid" id="scanner-container">
+                    <div class="loading-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading Stock Indicators...</div>
+                </div>
+            </section>
+
+            <section class="panel" id="scout-panel">
+                <div class="panel-header">
+                    <h3><i class="fa-solid fa-binoculars"></i> Near setups (scout)</h3>
+                    <span class="scout-watch-tag" title="Close but not confirmed — full scout signals auto-buy separately">CLOSE · NOT CONFIRMED</span>
+                </div>
+                <p class="scout-hint" id="scout-hint">
+                    Names close to trend_pullback entry (not confirmed yet).
+                    Scout universe (~Nifty 50) auto-buys on full signal under the same risk caps; core 12 stay on Strategy Scanner.
+                </p>
+                <div class="table-responsive">
+                    <table class="data-table scout-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Price</th>
+                                <th>RSI</th>
+                                <th>ADX</th>
+                                <th>Score</th>
+                                <th>Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody id="scout-tbody">
+                            <tr>
+                                <td colspan="6" class="empty-state">Waiting for scout cycle…</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="panel">
+                <div class="panel-header">
+                    <h3 id="positions-title"><i class="fa-solid fa-list-check"></i> Open Positions</h3>
+                    <span class="count-tag" id="table-count-tag">0 Positions</span>
+                </div>
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Qty</th>
+                                <th>Avg Entry</th>
+                                <th>Current Price</th>
+                                <th>Market Value</th>
+                                <th>Stop-Loss</th>
+                                <th>Take-Profit</th>
+                                <th>Unrealized P&L</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positions-tbody">
+                            <tr>
+                                <td colspan="9" class="empty-state">No open positions currently held.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="panel">
+                <div class="panel-header">
+                    <h3><i class="fa-solid fa-book"></i> Recent Trades</h3>
+                </div>
+                <div class="table-responsive trades-scroll" id="trades-scroll-box">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Side/Status</th>
+                                <th>Qty</th>
+                                <th>Entry</th>
+                                <th>PnL</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="trades-tbody">
+                            <tr><td colspan="6" class="empty-state">Loading trades…</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="panel">
+                <div class="panel-header">
+                    <h3><i class="fa-solid fa-network-wired"></i> Dhan HQ Segment Expansion Status</h3>
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; padding: 15px;">
+                    <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px;">
+                        <span style="font-size: 0.8em; opacity: 0.7;">WebSocket Feed</span>
+                        <h4 style="margin: 5px 0;" id="segment-ws-status"><i class="fa-solid fa-wifi"></i> Live Streaming</h4>
+                    </div>
+                    <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px;">
+                        <span style="font-size: 0.8em; opacity: 0.7;">US Global Feed</span>
+                        <h4 style="margin: 5px 0;" id="segment-us-ws-status"><i class="fa-solid fa-wifi"></i> US Feed</h4>
+                    </div>
+                    <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px;">
+                        <span style="font-size: 0.8em; opacity: 0.7;">Product Mode</span>
+                        <h4 style="margin: 5px 0;" id="segment-product-type">CNC (Delivery)</h4>
+                    </div>
+                    <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px;">
+                        <span style="font-size: 0.8em; opacity: 0.7;">India F&O</span>
+                        <h4 style="margin: 5px 0; color: #4ade80;" id="segment-fno-status">PAPER ACTIVE</h4>
+                    </div>
+                    <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px;">
+                        <span style="font-size: 0.8em; opacity: 0.7;">MCX Commodities</span>
+                        <h4 style="margin: 5px 0; color: #fbbf24;" id="segment-mcx-status">PAPER ACTIVE</h4>
+                    </div>
+                    <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px;">
+                        <span style="font-size: 0.8em; opacity: 0.7;">Currency FX</span>
+                        <h4 style="margin: 5px 0; color: #60a5fa;" id="segment-fx-status">PAPER ACTIVE</h4>
+                    </div>
+                </div>
+                <div class="panel-header" style="border-top: 1px solid rgba(255,255,255,0.08);">
+                    <h3 style="font-size: 1rem;"><i class="fa-solid fa-layer-group"></i> Expansion Positions (F&O / MCX / FX)</h3>
+                    <span class="count-tag" id="expansion-pos-count">0</span>
+                </div>
+                <div class="table-responsive">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Segment</th>
+                                <th>Symbol</th>
+                                <th>Qty</th>
+                                <th>Avg Entry</th>
+                                <th>Mark</th>
+                                <th>Market Value</th>
+                                <th>Unrealized P&L</th>
+                            </tr>
+                        </thead>
+                        <tbody id="expansion-positions-tbody">
+                            <tr>
+                                <td colspan="7" class="empty-state">No F&O / MCX / FX positions.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="panel log-panel">
+                <div class="panel-header">
+                    <h3><i class="fa-solid fa-terminal"></i> Execution Log</h3>
+                </div>
+                <div class="log-terminal" id="log-terminal">
+                    <div class="log-line info">Initialising dashboard stream...</div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}?v=84b88cf2"></script>
+</body>
+</html>

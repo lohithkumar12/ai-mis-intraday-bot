@@ -1,0 +1,53 @@
+# ============================================================
+# AI MIS Intraday Bot — Docker Compose (isolated from CNC bot)
+# Usage (GCP VM):
+#   docker compose up -d --build
+#   docker compose logs -f bot
+#   docker compose down
+# Dashboard: http://EXTERNAL_IP:81  (host 81 → container 8080)
+# CNC New_StartUp typically uses port 80 / ai_stock_trading_bot — do not collide.
+# ============================================================
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai_mis_intraday_bot
+    restart: unless-stopped
+    user: "root"
+    ports:
+      - "81:8080"
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      TRADE_JOURNAL_PATH: /app/data/trade_journal.db
+      INDIA_PAPER_PORTFOLIO_PATH: /app/data/india_paper_portfolio.json
+      US_PAPER_PORTFOLIO_PATH: /app/data/us_paper_portfolio.json
+      INDIA_FNO_PAPER_PORTFOLIO_PATH: /app/data/india_fno_paper_portfolio.json
+      MCX_PAPER_PORTFOLIO_PATH: /app/data/mcx_paper_portfolio.json
+      CURRENCY_PAPER_PORTFOLIO_PATH: /app/data/currency_paper_portfolio.json
+    volumes:
+      - mis_bot_data:/app/data
+      - mis_bot_logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+        reservations:
+          memory: 256M
+          cpus: "0.25"
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  mis_bot_data:
+    driver: local
+  mis_bot_logs:
+    driver: local

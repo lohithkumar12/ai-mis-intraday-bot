@@ -1,0 +1,48 @@
+# Environment secrets — NEVER commit this
+.env
+
+# Virtual paper portfolio state
+india_paper_portfolio.json
+us_paper_portfolio.json
+india_fno_paper_portfolio.json
+mcx_paper_portfolio.json
+currency_paper_portfolio.json
+
+# Cached Dhan access token (auto-refreshed via PIN/TOTP — do not commit)
+dhan_access_token.cache
+
+# Trade journal (local SQLite)
+trade_journal.db
+*.db
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Log files
+*.log
+logs/
+
+# Docker local data (named volumes are preferred on VM)
+data/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Test / cache
+.pytest_cache/
+__pycache__/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
