@@ -68,6 +68,47 @@ def _dhan_product_type(product_type: str | None = None):
     return getattr(dhanhq, "CNC", "CNC")
 
 
+_MIS_PRODUCT_NAMES = frozenset({"INTRADAY", "INTRA", "MIS"})
+
+
+def _trading_product_is_mis(product_type: str | None = None) -> bool:
+    p = (product_type or config.INDIA_PRODUCT_TYPE or "CNC").strip().upper()
+    return p in _MIS_PRODUCT_NAMES
+
+
+def _row_product(row: dict) -> str:
+    return str(
+        row.get("productType")
+        or row.get("product")
+        or row.get("product_type")
+        or ""
+    ).strip().upper()
+
+
+def should_include_open_position(
+    *,
+    net_qty: int,
+    product: str,
+    trading_is_mis: bool,
+) -> bool:
+    """
+    Decide whether a Dhan positions-API row counts as an open trade.
+
+    Sold-from-holding CNC day sells often arrive with netQty < 0 and must not
+    be treated as open longs (abs(qty) previously inflated MAX_OPEN_POSITIONS).
+    MIS bots only count INTRADAY/MIS rows — not CNC holdings or delivery sells.
+    """
+    if net_qty == 0:
+        return False
+    product = (product or "").strip().upper()
+    if trading_is_mis:
+        return product in _MIS_PRODUCT_NAMES
+    # CNC/delivery sleeve: ignore negative day sells (sold-from-holding).
+    if net_qty < 0:
+        return False
+    return True
+
+
 def _resolved_security_id(symbol: str, exchange_segment: str | None = None) -> tuple[str | None, str]:
     """Prefer numeric master/token IDs; never send invented symbol strings as security_id."""
     info = resolve_instrument_info(symbol, exchange_segment=exchange_segment or "NSE")
@@ -1093,6 +1134,7 @@ class DhanBroker:
         token_to_symbol = {
             info["token"]: sym for sym, info in INDIA_INSTRUMENTS.items()
         }
+        mis_mode = _trading_product_is_mis()
 
         try:
             resp = self.dhan.get_positions()
@@ -1108,7 +1150,12 @@ class DhanBroker:
                         or 0
                     )
                 )
-                if net_qty == 0:
+                product = _row_product(pos)
+                if not should_include_open_position(
+                    net_qty=net_qty,
+                    product=product,
+                    trading_is_mis=mis_mode,
+                ):
                     continue
                 sec_id = str(pos.get("securityId") or pos.get("security_id") or "")
                 trading_symbol = (
@@ -1139,54 +1186,70 @@ class DhanBroker:
                     "trading_symbol": trading_symbol,
                     "token": sec_id,
                     "source": "position",
+                    "product": product or ("INTRADAY" if mis_mode else "CNC"),
+                    "side": "SELL" if net_qty < 0 else "BUY",
                 }
         except Exception as e:
             logger.error(f"Dhan positions error: {e}", exc_info=True)
 
-        try:
-            resp = self.dhan.get_holdings()
-            data = self._data(resp) if self._ok(resp) else None
-            for h in data or []:
-                if not isinstance(h, dict):
-                    continue
-                qty = int(float(h.get("availableQty") or h.get("totalQty") or h.get("quantity") or 0))
-                if qty <= 0:
-                    continue
-                sec_id = str(h.get("securityId") or h.get("security_id") or "")
-                trading_symbol = (
-                    h.get("tradingSymbol")
-                    or h.get("trading_symbol")
-                    or h.get("symbol")
-                    or ""
-                )
-                symbol = token_to_symbol.get(sec_id) or str(trading_symbol).replace(
-                    "-EQ", ""
-                )
-                if symbol in pos_dict:
-                    continue
-                buy_price = float(h.get("avgCostPrice") or h.get("averagePrice") or 0)
-                ltp = float(h.get("ltp") or h.get("lastTradedPrice") or 0)
-                pnl = float(h.get("unrealizedProfit") or h.get("pnl") or 0)
-                if buy_price <= 0 and ltp > 0:
-                    buy_price = ltp
-                pnl_pct = ((ltp - buy_price) / buy_price) if buy_price > 0 else 0
-                pos_dict[symbol] = {
-                    "qty": qty,
-                    "avg_entry_price": buy_price,
-                    "current_price": ltp,
-                    "market_value": qty * ltp,
-                    "unrealized_pl": pnl,
-                    "unrealized_plpc": pnl_pct,
-                    "trading_symbol": trading_symbol,
-                    "token": sec_id,
-                    "source": "holding",
-                }
-        except Exception as e:
-            logger.warning(f"Dhan holdings fetch warning: {e}")
+        # CNC sleeve may still show overnight holdings as exposure.
+        # MIS bots must not — holdings would block new ORB entries and confuse SL/square-off.
+        if not mis_mode:
+            try:
+                resp = self.dhan.get_holdings()
+                data = self._data(resp) if self._ok(resp) else None
+                for h in data or []:
+                    if not isinstance(h, dict):
+                        continue
+                    qty = int(
+                        float(
+                            h.get("availableQty")
+                            or h.get("totalQty")
+                            or h.get("quantity")
+                            or 0
+                        )
+                    )
+                    if qty <= 0:
+                        continue
+                    sec_id = str(h.get("securityId") or h.get("security_id") or "")
+                    trading_symbol = (
+                        h.get("tradingSymbol")
+                        or h.get("trading_symbol")
+                        or h.get("symbol")
+                        or ""
+                    )
+                    symbol = token_to_symbol.get(sec_id) or str(trading_symbol).replace(
+                        "-EQ", ""
+                    )
+                    if symbol in pos_dict:
+                        continue
+                    buy_price = float(
+                        h.get("avgCostPrice") or h.get("averagePrice") or 0
+                    )
+                    ltp = float(h.get("ltp") or h.get("lastTradedPrice") or 0)
+                    pnl = float(h.get("unrealizedProfit") or h.get("pnl") or 0)
+                    if buy_price <= 0 and ltp > 0:
+                        buy_price = ltp
+                    pnl_pct = ((ltp - buy_price) / buy_price) if buy_price > 0 else 0
+                    pos_dict[symbol] = {
+                        "qty": qty,
+                        "avg_entry_price": buy_price,
+                        "current_price": ltp,
+                        "market_value": qty * ltp,
+                        "unrealized_pl": pnl,
+                        "unrealized_plpc": pnl_pct,
+                        "trading_symbol": trading_symbol,
+                        "token": sec_id,
+                        "source": "holding",
+                        "product": "CNC",
+                        "side": "BUY",
+                    }
+            except Exception as e:
+                logger.warning(f"Dhan holdings fetch warning: {e}")
 
         if pos_dict:
             self._backfill_zero_ltp_from_quotes(pos_dict)
-            logger.info(f"India positions/holdings: {list(pos_dict.keys())}")
+            logger.info(f"India open positions: {list(pos_dict.keys())}")
         return pos_dict
 
     # -----------------------------------------------------------------------
