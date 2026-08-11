@@ -36,6 +36,8 @@ INDIA_CAPITAL_CAP=150000
 
 ## Docker (GCP VM) — isolated from CNC
 
+**Deploy MIS on Dhan primary IP only** (`35.200.221.125`). Secondary IP (`35.200.249.211`) can hit **DH-905 Invalid IP** on order APIs. See [`MIGRATE_PRIMARY_VM.md`](MIGRATE_PRIMARY_VM.md).
+
 ```bash
 cd ai-mis-intraday-bot
 docker compose up -d --build
@@ -43,8 +45,9 @@ docker compose logs -f bot
 ```
 
 - Container: **`ai_mis_intraday_bot`**
-- Dashboard: **`http://EXTERNAL_IP:81`** (maps `81→8080`)
-- Do **not** reuse CNC’s `ai_stock_trading_bot` / port 80
+- Dashboard: **`http://35.200.221.125:81/`** (maps `81→8080`)
+- CNC on same host: port **80** / `ai_stock_trading_bot` — do not collide
+- Run **one** live MIS instance only (stop secondary VM compose)
 
 ## Key knobs
 

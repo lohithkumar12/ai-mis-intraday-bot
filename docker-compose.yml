@@ -4,7 +4,8 @@
 #   docker compose up -d --build
 #   docker compose logs -f bot
 #   docker compose down
-# Dashboard: http://EXTERNAL_IP:81  (host 81 → container 8080)
+# Dashboard: http://35.200.221.125:81  (host 81 → container 8080)
+# Prefer Dhan PRIMARY IP VM only (secondary can get DH-905 Invalid IP on orders).
 # CNC New_StartUp typically uses port 80 / ai_stock_trading_bot — do not collide.
 # ============================================================
 
