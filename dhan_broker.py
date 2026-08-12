@@ -1431,17 +1431,13 @@ class DhanBroker:
                     or 0
                 )
                 ltp = float(pos.get("ltp") or pos.get("lastTradedPrice") or 0)
-                pnl_raw = pos.get("unrealizedProfit")
-                if pnl_raw is None or pnl_raw == "":
-                    pnl_raw = pos.get("pnl")
                 qty_abs = abs(net_qty)
-                if pnl_raw is None or pnl_raw == "":
-                    if side == "SELL":
-                        pnl = (avg_entry - ltp) * qty_abs if avg_entry > 0 and ltp > 0 else 0.0
-                    else:
-                        pnl = (ltp - avg_entry) * qty_abs if avg_entry > 0 and ltp > 0 else 0.0
+                # Normalize MTM by side so dashboard and logs never depend on
+                # broker payload sign conventions for short positions.
+                if side == "SELL":
+                    pnl = (avg_entry - ltp) * qty_abs if avg_entry > 0 and ltp > 0 else 0.0
                 else:
-                    pnl = float(pnl_raw)
+                    pnl = (ltp - avg_entry) * qty_abs if avg_entry > 0 and ltp > 0 else 0.0
                 if avg_entry > 0 and ltp > 0:
                     pnl_pct = ((avg_entry - ltp) / avg_entry) if side == "SELL" else ((ltp - avg_entry) / avg_entry)
                 else:
@@ -1828,10 +1824,26 @@ class DhanBroker:
             return None
         pos = positions[symbol]
         qty = int(pos["qty"])
+        side = str(pos.get("side") or "BUY").upper()
+        product = str(pos.get("product") or config.INDIA_PRODUCT_TYPE or "INTRADAY")
         fallback = float(
             pos.get("current_price") or pos.get("avg_entry_price") or 0
         )
-        order_id = self.place_sell_order(symbol, qty, order_type="MARKET")
+        if side == "SELL":
+            # Short position -> BUY to cover.
+            order_id = self.place_buy_order(
+                symbol=symbol,
+                qty=qty,
+                limit_price=max(fallback, 0.01),
+                place_stoploss=False,
+                stop_loss_price=0.0,
+                take_profit_price=None,
+                product_type=product,
+            )
+        else:
+            order_id = self.place_sell_order(
+                symbol, qty, order_type="MARKET", product_type=product
+            )
         if not order_id:
             return None
 
@@ -1898,35 +1910,63 @@ class DhanBroker:
                     entry_price, stop_loss_price=sl_price, atr=atr
                 )
 
-            if symbol not in getattr(risk_mgr, "_trade_meta", {}):
-                risk_mgr.register_trade(symbol, entry_price, sl_price, atr)
-
-            trailed = risk_mgr.update_trailing_stop(symbol, current_price, atr)
-            if trailed is not None and trailed > sl_price:
-                sl_price = trailed
-                if self.paper is not None:
-                    self.paper.update_position_meta(
-                        symbol,
-                        stop_loss=sl_price,
-                        peak_price=max(
-                            float(pos.get("peak_price") or entry_price),
-                            current_price,
-                        ),
-                    )
-
+            side = str(pos.get("side") or "BUY").upper()
             reason = None
-            if current_price <= sl_price:
-                reason = "stop_loss"
-                logger.warning(
-                    f"[INDIA SL] {symbol} hit stop! "
-                    f"Entry={entry_price:.2f} Px={current_price:.2f} SL={sl_price:.2f}"
-                )
-            elif current_price >= tp_price:
-                reason = "take_profit"
-                logger.info(
-                    f"[INDIA TP] {symbol} hit target! "
-                    f"Entry={entry_price:.2f} Px={current_price:.2f} TP={tp_price:.2f}"
-                )
+            if side == "SELL":
+                # For shorts: stop is above entry, target below entry.
+                if stored_sl is None:
+                    if atr is not None and atr > 0:
+                        sl_price = entry_price + (risk_mgr.atr_stop_mult * atr)
+                    else:
+                        sl_price = entry_price * (1 + risk_mgr.stop_loss_pct)
+                if stored_tp is None:
+                    risk = max(sl_price - entry_price, 0.0)
+                    if risk > 0:
+                        tp_price = entry_price - (risk_mgr.take_profit_r * risk)
+                    else:
+                        tp_price = entry_price * (1 - risk_mgr.take_profit_pct)
+
+                if current_price >= sl_price:
+                    reason = "stop_loss"
+                    logger.warning(
+                        f"[INDIA SL][SHORT] {symbol} hit stop! "
+                        f"Entry={entry_price:.2f} Px={current_price:.2f} SL={sl_price:.2f}"
+                    )
+                elif current_price <= tp_price:
+                    reason = "take_profit"
+                    logger.info(
+                        f"[INDIA TP][SHORT] {symbol} hit target! "
+                        f"Entry={entry_price:.2f} Px={current_price:.2f} TP={tp_price:.2f}"
+                    )
+            else:
+                if symbol not in getattr(risk_mgr, "_trade_meta", {}):
+                    risk_mgr.register_trade(symbol, entry_price, sl_price, atr)
+
+                trailed = risk_mgr.update_trailing_stop(symbol, current_price, atr)
+                if trailed is not None and trailed > sl_price:
+                    sl_price = trailed
+                    if self.paper is not None:
+                        self.paper.update_position_meta(
+                            symbol,
+                            stop_loss=sl_price,
+                            peak_price=max(
+                                float(pos.get("peak_price") or entry_price),
+                                current_price,
+                            ),
+                        )
+
+                if current_price <= sl_price:
+                    reason = "stop_loss"
+                    logger.warning(
+                        f"[INDIA SL] {symbol} hit stop! "
+                        f"Entry={entry_price:.2f} Px={current_price:.2f} SL={sl_price:.2f}"
+                    )
+                elif current_price >= tp_price:
+                    reason = "take_profit"
+                    logger.info(
+                        f"[INDIA TP] {symbol} hit target! "
+                        f"Entry={entry_price:.2f} Px={current_price:.2f} TP={tp_price:.2f}"
+                    )
 
             if reason:
                 fill = self.close_position(symbol)

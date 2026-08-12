@@ -278,20 +278,39 @@ def get_india_positions():
 
     for symbol, pos in positions_dict.items():
         entry_price = pos["avg_entry_price"]
+        side = str(pos.get("side") or "BUY").upper()
         atr = pos.get("atr")
         sl_price = pos.get("stop_loss")
         tp_price = pos.get("take_profit")
         if sl_price is None:
-            sl_price = risk_mgr.get_stop_loss_price(entry_price, atr)
+            if side == "SELL":
+                if atr is not None:
+                    try:
+                        sl_price = float(entry_price) + (
+                            float(risk_mgr.atr_stop_mult) * float(atr)
+                        )
+                    except Exception:
+                        sl_price = float(entry_price) * (1 + float(risk_mgr.stop_loss_pct))
+                else:
+                    sl_price = float(entry_price) * (1 + float(risk_mgr.stop_loss_pct))
+            else:
+                sl_price = risk_mgr.get_stop_loss_price(entry_price, atr)
         if tp_price is None:
-            tp_price = risk_mgr.get_take_profit_price(
-                entry_price, stop_loss_price=sl_price, atr=atr
-            )
+            if side == "SELL":
+                risk = max(float(sl_price) - float(entry_price), 0.0)
+                if risk > 0:
+                    tp_price = float(entry_price) - (float(risk_mgr.take_profit_r) * risk)
+                else:
+                    tp_price = float(entry_price) * (1 - float(risk_mgr.take_profit_pct))
+            else:
+                tp_price = risk_mgr.get_take_profit_price(
+                    entry_price, stop_loss_price=sl_price, atr=atr
+                )
 
         positions_list.append({
             "symbol": symbol,
             "qty": pos["qty"],
-            "side": str(pos.get("side") or "BUY").upper(),
+            "side": side,
             "avg_entry_price": entry_price,
             "current_price": pos["current_price"],
             "market_value": pos["market_value"],

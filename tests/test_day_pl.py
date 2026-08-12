@@ -71,6 +71,22 @@ class TestBrokerStyleDayPl(unittest.TestCase):
         self.assertAlmostEqual(day_pl, 7.5)
         self.assertAlmostEqual(detail["unrealized"], 7.5)
 
+    def test_short_position_unrealized_uses_side_aware_formula(self):
+        broker = MagicMock(spec=["get_open_positions"])
+        broker.get_open_positions.return_value = {
+            "MARUTI": {
+                "qty": 16,
+                "side": "SELL",
+                "avg_entry_price": 13948.444,
+                "current_price": 13929.0,
+                "unrealized_pl": -311.1,  # broker raw sign can differ
+            }
+        }
+        with patch.object(trade_journal, "realized_pnl_today", return_value=0.0):
+            day_pl, _, detail = _broker_style_day_pl("INDIA", broker, 300_000.0)
+        self.assertAlmostEqual(day_pl, (13948.444 - 13929.0) * 16, places=3)
+        self.assertGreater(detail["unrealized"], 0.0)
+
     def test_day_pl_resynces_bad_exits_from_broker_fills(self):
         with tempfile.TemporaryDirectory() as tmp:
             old = config.TRADE_JOURNAL_PATH
