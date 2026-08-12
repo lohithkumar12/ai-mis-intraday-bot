@@ -83,6 +83,7 @@ def record_entry(
     symbol: str,
     qty: int,
     entry_price: float,
+    side: str = "BUY",
     stop_price: float | None = None,
     take_profit: float | None = None,
     reason: str = "",
@@ -96,11 +97,12 @@ def record_entry(
             INSERT INTO trades (
                 market, symbol, side, qty, entry_price, stop_price, take_profit,
                 reason, strategy, status, opened_at, meta_json
-            ) VALUES (?, ?, 'BUY', ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
             """,
             (
                 market.upper(),
                 symbol,
+                str(side or "BUY").upper(),
                 qty,
                 entry_price,
                 stop_price,
@@ -142,8 +144,13 @@ def record_exit(
 
         entry = float(row["entry_price"] or 0)
         q = int(qty if qty is not None else row["qty"])
-        pnl = (exit_price - entry) * q
-        pnl_pct = ((exit_price - entry) / entry) if entry else 0.0
+        side = str(row["side"] or "BUY").upper()
+        if side == "SELL":
+            pnl = (entry - exit_price) * q
+            pnl_pct = ((entry - exit_price) / entry) if entry else 0.0
+        else:
+            pnl = (exit_price - entry) * q
+            pnl_pct = ((exit_price - entry) / entry) if entry else 0.0
         reason_final = reason or row["reason"] or "exit"
 
         conn.execute(
@@ -301,8 +308,13 @@ def update_closed_trade_exit(
             return None
         entry = float(row["entry_price"] or 0)
         q = int(row["qty"] or 0)
-        pnl = (px - entry) * q
-        pnl_pct = ((px - entry) / entry) if entry else 0.0
+        side = str(row["side"] or "BUY").upper()
+        if side == "SELL":
+            pnl = (entry - px) * q
+            pnl_pct = ((entry - px) / entry) if entry else 0.0
+        else:
+            pnl = (px - entry) * q
+            pnl_pct = ((px - entry) / entry) if entry else 0.0
         reason_final = reason if reason is not None else (row["reason"] or "exit")
         conn.execute(
             """

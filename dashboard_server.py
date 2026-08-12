@@ -11,6 +11,7 @@ Supports:
 import logging
 import os
 import time
+import json
 from datetime import datetime, timezone
 import threading
 
@@ -610,6 +611,7 @@ def close_india_position(symbol):
         return jsonify({"status": "error", "message": f"No open India position for {symbol}"}), 404
 
     qty = int(pos.get("qty") or 0)
+    side = str(pos.get("side") or "BUY").upper()
     entry = float(pos.get("avg_entry_price") or 0)
     exit_px = float(pos.get("current_price") or 0)
     if exit_px <= 0:
@@ -640,6 +642,7 @@ def close_india_position(symbol):
             symbol,
             qty,
             entry,
+            side=side,
             reason="manual_close_backfill",
             strategy=config.STRATEGY_NAME,
         )
@@ -1117,7 +1120,37 @@ def get_performance():
 def get_trades():
     market = request.args.get("market", "INDIA").upper()
     limit = int(request.args.get("limit", "50"))
-    return jsonify(trade_journal.recent_trades(limit=limit, market=market))
+    rows = trade_journal.recent_trades(limit=limit, market=market)
+
+    # Journal historically stored side='BUY' for all entries.
+    # For India + Dhan, prefer broker order-side so Recent Trades mirrors Dhan.
+    if market == "INDIA":
+        try:
+            india_broker, _ = get_india_components()
+            get_side = getattr(india_broker, "get_order_transaction_side", None)
+            if callable(get_side):
+                side_cache: dict[str, str] = {}
+                for r in rows:
+                    meta = {}
+                    raw_meta = r.get("meta_json")
+                    if raw_meta:
+                        try:
+                            meta = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
+                        except Exception:
+                            meta = {}
+                    oid = str(meta.get("order_id") or "").strip()
+                    if not oid:
+                        continue
+                    side = side_cache.get(oid)
+                    if side is None:
+                        side = str(get_side(oid) or "").upper()
+                        side_cache[oid] = side
+                    if side in ("BUY", "SELL"):
+                        r["side"] = side
+        except Exception as e:
+            logger.debug(f"trade-side enrichment skipped: {e}")
+
+    return jsonify(rows)
 
 
 def pd_isna(val):

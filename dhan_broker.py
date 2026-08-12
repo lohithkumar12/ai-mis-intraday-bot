@@ -1065,6 +1065,33 @@ class DhanBroker:
             logger.warning(f"Order status lookup failed for {order_id}: {e}")
             return "UNKNOWN", str(e)
 
+    def get_order_transaction_side(self, order_id: str) -> str:
+        """Return BUY/SELL for a day order id, else empty string."""
+        if self.paper is not None or not order_id:
+            return ""
+        self.ensure_session()
+        if not self.dhan:
+            return ""
+        try:
+            method = getattr(self.dhan, "get_order_by_id", None)
+            if not callable(method):
+                return ""
+            resp = method(str(order_id))
+            if self._resp_looks_like_auth_failure(resp):
+                if self._force_relogin("get_order_by_id"):
+                    resp = method(str(order_id))
+            row = self._parse_order_payload(resp)
+            side = str(
+                row.get("transactionType")
+                or row.get("transaction_type")
+                or row.get("side")
+                or ""
+            ).upper()
+            return side if side in ("BUY", "SELL") else ""
+        except Exception as e:
+            logger.debug(f"order side lookup failed for {order_id}: {e}")
+            return ""
+
     def get_order_fill_price(self, order_id: str) -> float:
         """Average traded / fill price from order book; 0 if unknown."""
         if self.paper is not None or not order_id:
