@@ -1420,27 +1420,44 @@ class DhanBroker:
                 symbol = token_to_symbol.get(sec_id) or str(trading_symbol).replace(
                     "-EQ", ""
                 )
-                buy_price = float(
+                side = "SELL" if net_qty < 0 else "BUY"
+                avg_entry = float(
                     pos.get("avgCostPrice")
                     or pos.get("averagePrice")
+                    or (pos.get("sellAvg") if side == "SELL" else pos.get("buyAvg"))
+                    or pos.get("avgSellPrice")
+                    or pos.get("averageSellPrice")
                     or pos.get("buyAvg")
                     or 0
                 )
                 ltp = float(pos.get("ltp") or pos.get("lastTradedPrice") or 0)
-                pnl = float(pos.get("unrealizedProfit") or pos.get("pnl") or 0)
-                pnl_pct = ((ltp - buy_price) / buy_price) if buy_price > 0 else 0
+                pnl_raw = pos.get("unrealizedProfit")
+                if pnl_raw is None or pnl_raw == "":
+                    pnl_raw = pos.get("pnl")
+                qty_abs = abs(net_qty)
+                if pnl_raw is None or pnl_raw == "":
+                    if side == "SELL":
+                        pnl = (avg_entry - ltp) * qty_abs if avg_entry > 0 and ltp > 0 else 0.0
+                    else:
+                        pnl = (ltp - avg_entry) * qty_abs if avg_entry > 0 and ltp > 0 else 0.0
+                else:
+                    pnl = float(pnl_raw)
+                if avg_entry > 0 and ltp > 0:
+                    pnl_pct = ((avg_entry - ltp) / avg_entry) if side == "SELL" else ((ltp - avg_entry) / avg_entry)
+                else:
+                    pnl_pct = 0.0
                 pos_dict[symbol] = {
-                    "qty": abs(net_qty),
-                    "avg_entry_price": buy_price,
+                    "qty": qty_abs,
+                    "avg_entry_price": avg_entry,
                     "current_price": ltp,
-                    "market_value": abs(net_qty) * ltp,
+                    "market_value": qty_abs * ltp,
                     "unrealized_pl": pnl,
                     "unrealized_plpc": pnl_pct,
                     "trading_symbol": trading_symbol,
                     "token": sec_id,
                     "source": "position",
                     "product": product or ("INTRADAY" if mis_mode else "CNC"),
-                    "side": "SELL" if net_qty < 0 else "BUY",
+                    "side": side,
                 }
         except Exception as e:
             logger.error(f"Dhan positions error: {e}", exc_info=True)

@@ -334,11 +334,13 @@ function updatePositionsUI(positions, formatter, closeFnName) {
     positions.forEach(pos => {
         const plClass = pos.unrealized_pl >= 0 ? "pl-positive" : "pl-negative";
         const plSign = pos.unrealized_pl >= 0 ? "+" : "";
+        const side = String(pos.side || "BUY").toUpperCase();
+        const qtyText = side === "SELL" ? `-${Math.abs(Number(pos.qty || 0))}` : `${pos.qty}`;
 
         rowsHtml += `
             <tr>
                 <td style="font-weight:700; color:var(--text-main);">${pos.symbol}</td>
-                <td>${pos.qty}</td>
+                <td>${qtyText}</td>
                 <td>${formatter(pos.avg_entry_price)}</td>
                 <td>${formatter(pos.current_price)}</td>
                 <td>${formatter(pos.market_value)}</td>

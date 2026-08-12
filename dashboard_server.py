@@ -66,8 +66,12 @@ def _broker_style_day_pl(
         cur = float(pos.get("current_price") or 0)
         if qty > 0 and avg > 0:
             cost += qty * avg
+        side = str(pos.get("side") or "BUY").upper()
         if qty > 0 and avg > 0 and cur > 0:
-            unreal += (cur - avg) * qty
+            if side == "SELL":
+                unreal += (avg - cur) * qty
+            else:
+                unreal += (cur - avg) * qty
         else:
             unreal += float(pos.get("unrealized_pl") or 0)
 
@@ -287,6 +291,7 @@ def get_india_positions():
         positions_list.append({
             "symbol": symbol,
             "qty": pos["qty"],
+            "side": str(pos.get("side") or "BUY").upper(),
             "avg_entry_price": entry_price,
             "current_price": pos["current_price"],
             "market_value": pos["market_value"],
