@@ -15,6 +15,10 @@ dhan_access_token.cache
 trade_journal.db
 *.db
 
+# Runtime trade/ORB state (persisted locally; do not commit)
+india_trade_state.json
+orb_day_fired.json
+
 # Python caches
 __pycache__/
 *.pyc

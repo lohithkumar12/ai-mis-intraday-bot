@@ -1357,11 +1357,12 @@ class DhanBroker:
 
         Returns (accepted, status_or_reason).
         - REJECTED/CANCELLED/EXPIRED → (False, reason) + buy cooldown
-        - TRADED/PART_TRADED → (True, status)
-        - Still open after timeout → (True, PENDING) + pending cooldown
-          so we do not spam a second entry while the first sits.
+        - TRADED/PART_TRADED/COMPLETE → (True, status)  # fill only
+        - Still open after timeout → (False, PENDING) + pending cooldown
+          (does NOT count as a successful fill — no journal / day-fire)
         """
         if self.paper is not None:
+            self.last_order_status = "paper"
             return True, "paper"
         if not order_id:
             return False, "missing order id"
@@ -1380,26 +1381,96 @@ class DhanBroker:
                 msg = f"{last_status}: {last_detail}"
                 logger.error(f"{symbol}: live order {order_id} rejected — {msg}")
                 self.last_error = msg
+                self.last_order_status = last_status
                 order_guards.block_buy_after_reject(symbol, last_detail)
                 return False, msg
             if last_status in _FILL_STATUSES:
-                logger.info(f"{symbol}: order {order_id} confirmed {last_status}")
+                filled_qty = self.get_order_filled_qty(order_id)
+                self.last_fill_qty = int(filled_qty) if filled_qty > 0 else int(
+                    getattr(self, "last_fill_qty", 0) or 0
+                )
+                self.last_order_status = last_status
+                logger.info(
+                    f"{symbol}: order {order_id} confirmed {last_status} "
+                    f"filled_qty={self.last_fill_qty}"
+                )
+                # PART_TRADED with zero filled qty is not a usable fill
+                if last_status == "PART_TRADED" and self.last_fill_qty <= 0:
+                    order_guards.block_buy_after_pending(symbol, order_id)
+                    self.last_error = "PART_TRADED with zero filled qty"
+                    return False, "PART_TRADED_ZERO_FILL"
                 return True, last_status
             time.sleep(0.75)
 
         if last_status in _OPEN_STATUSES or last_status in ("", "UNKNOWN"):
             logger.warning(
                 f"{symbol}: order {order_id} still {last_status or 'PENDING'} "
-                f"after {timeout:.0f}s — treating as working, cooldown on re-buy"
+                f"after {timeout:.0f}s — NOT treating as fill; cooldown on re-buy"
             )
             order_guards.block_buy_after_pending(symbol, order_id)
-            return True, last_status or "PENDING"
+            self.last_error = f"pending:{last_status or 'PENDING'}"
+            self.last_order_status = last_status or "PENDING"
+            return False, last_status or "PENDING"
 
-        # Unexpected terminal-ish status
         if last_status in _REJECT_STATUSES:
             order_guards.block_buy_after_reject(symbol, last_detail)
+            self.last_order_status = last_status
             return False, f"{last_status}: {last_detail}"
-        return True, last_status
+        # Unknown terminal — do not treat as fill
+        self.last_order_status = last_status
+        self.last_error = f"unconfirmed:{last_status}"
+        order_guards.block_buy_after_pending(symbol, order_id)
+        return False, last_status
+
+    def get_order_filled_qty(self, order_id: str) -> int:
+        """Filled/traded quantity from order book; 0 if unknown."""
+        if self.paper is not None or not order_id:
+            return int(getattr(self, "last_fill_qty", 0) or 0)
+        if not getattr(self, "dhan", None):
+            return int(getattr(self, "last_fill_qty", 0) or 0)
+        try:
+            if hasattr(self, "ensure_session"):
+                self.ensure_session()
+        except Exception:
+            pass
+        if not getattr(self, "dhan", None):
+            return 0
+        try:
+            method = getattr(self.dhan, "get_order_by_id", None)
+            if not callable(method):
+                return 0
+            resp = method(str(order_id))
+            row = self._parse_order_payload(resp)
+            for key in (
+                "filledQty",
+                "filled_qty",
+                "tradedQuantity",
+                "traded_quantity",
+                "quantityTraded",
+                "filled_quantity",
+            ):
+                raw = row.get(key)
+                if raw is None or raw == "":
+                    continue
+                try:
+                    qty = int(float(raw))
+                except (TypeError, ValueError):
+                    continue
+                if qty > 0:
+                    return qty
+            # Some payloads use remaining vs total
+            try:
+                total = int(float(row.get("quantity") or row.get("qty") or 0))
+                remaining = int(
+                    float(row.get("remainingQuantity") or row.get("remaining_quantity") or -1)
+                )
+                if total > 0 and remaining >= 0 and total >= remaining:
+                    return max(0, total - remaining)
+            except (TypeError, ValueError):
+                pass
+        except Exception as e:
+            logger.debug(f"filled qty lookup failed for {order_id}: {e}")
+        return 0
 
     # -----------------------------------------------------------------------
     # Positions
@@ -1620,6 +1691,10 @@ class DhanBroker:
                 atr=atr,
             )
             self.last_fill_price = float(fill) if fill and float(fill) > 0 else float(limit_price)
+            self.last_fill_qty = int(qty)
+            self.last_order_status = "paper"
+            self.last_sl_order_id = None
+            self.last_super_order_id = None
             return oid
 
         self.ensure_session()
@@ -1629,6 +1704,10 @@ class DhanBroker:
         if not sec_id:
             logger.error(f"Cannot place order — no security_id for {symbol}")
             return None
+
+        self.last_fill_qty = 0
+        self.last_sl_order_id = None
+        self.last_super_order_id = None
 
         # Live Super Order preferential routing if target & SL available
         if stop_loss_price and take_profit_price:
@@ -1643,11 +1722,19 @@ class DhanBroker:
                         f"SUPER BUY not confirmed for {symbol} | Order ID={oid} | {status}"
                     )
                     return None
+                filled_qty = int(getattr(self, "last_fill_qty", 0) or 0)
+                if filled_qty <= 0:
+                    filled_qty = self.get_order_filled_qty(oid) or int(qty)
+                if filled_qty <= 0:
+                    logger.error(f"SUPER BUY {symbol}: no filled qty after {status}")
+                    return None
+                self.last_fill_qty = filled_qty
+                self.last_super_order_id = str(oid)
                 # Swing CNC: also arm Forever GTT for multi-day SL backup
                 if p_type == "CNC" and stop_loss_price:
                     self.place_forever_order(
                         symbol,
-                        qty,
+                        filled_qty,
                         trigger_price=stop_loss_price,
                         price=round_sell_limit(stop_loss_price * 0.995),
                         transaction_type="SELL",
@@ -1659,7 +1746,7 @@ class DhanBroker:
                 )
                 self.last_fill_price = fill
                 logger.warning(
-                    f"LIVE SUPER BUY (Dhan) | {symbol} | Qty={qty} | "
+                    f"LIVE SUPER BUY (Dhan) | {symbol} | Qty={filled_qty}/{qty} | "
                     f"Order ID={oid} | Status={status} | Fill={fill:.2f}"
                 )
                 return oid
@@ -1692,12 +1779,21 @@ class DhanBroker:
                 )
                 return None
 
+            filled_qty = int(getattr(self, "last_fill_qty", 0) or 0)
+            if filled_qty <= 0:
+                filled_qty = self.get_order_filled_qty(order_id) or int(qty)
+            if filled_qty <= 0:
+                logger.error(f"BUY {symbol}: confirmed {status} but filled qty=0")
+                return None
+            self.last_fill_qty = filled_qty
+
             fill = self.resolve_entry_fill_price(
                 symbol, order_id, fallback=float(limit_price)
             )
             self.last_fill_price = fill
             logger.warning(
-                f"LIVE BUY ORDER (Dhan) | {symbol} | Product={p_type} ({dhan_ptype}) | Qty={qty} | "
+                f"LIVE BUY ORDER (Dhan) | {symbol} | Product={p_type} ({dhan_ptype}) | "
+                f"Qty={filled_qty}/{qty} | "
                 f"Limit={entry_price:.2f} | Fill={fill:.2f} | Order ID={order_id} | Status={status}"
             )
             if place_stoploss and stop_loss_price:
@@ -1705,14 +1801,17 @@ class DhanBroker:
                     # Multi-day swing: Forever GTT for SL (DAY SL orders expire)
                     self.place_forever_order(
                         symbol,
-                        qty,
+                        filled_qty,
                         trigger_price=stop_loss_price,
                         price=round_sell_limit(stop_loss_price * 0.995),
                         transaction_type="SELL",
                         product_type=p_type,
                     )
                 else:
-                    self.place_stoploss_order(symbol, qty, stop_loss_price, product_type=p_type)
+                    sl_oid = self.place_stoploss_order(
+                        symbol, filled_qty, stop_loss_price, product_type=p_type
+                    )
+                    self.last_sl_order_id = sl_oid
             return order_id
         except Exception as e:
             if self._handle_api_error(f"BUY {symbol}", e) and not getattr(
@@ -1863,64 +1962,165 @@ class DhanBroker:
         Flatten symbol. Returns exit fill price on success, else None.
         (Truthy float so existing `if close_position(...)` checks keep working.)
         """
-        positions = self.get_open_positions()
-        if positions is None:
-            logger.warning(f"{symbol}: skip close — positions snapshot unavailable")
+        if not order_guards.try_begin_exit(symbol):
+            logger.info(f"{symbol}: close skipped — exit already in flight")
             return None
-        if symbol not in positions:
-            logger.warning(f"{symbol}: No open position to close")
-            return None
-        pos = positions[symbol]
-        qty = int(pos["qty"])
-        side = str(pos.get("side") or "BUY").upper()
-        product = str(pos.get("product") or config.INDIA_PRODUCT_TYPE or "INTRADAY")
-        fallback = float(
-            pos.get("current_price") or pos.get("avg_entry_price") or 0
-        )
-        if side == "SELL":
-            # Short position -> BUY to cover.
-            order_id = self.place_buy_order(
-                symbol=symbol,
-                qty=qty,
-                limit_price=max(fallback, 0.01),
-                place_stoploss=False,
-                stop_loss_price=0.0,
-                take_profit_price=None,
-                product_type=product,
+        try:
+            positions = self.get_open_positions()
+            if positions is None:
+                logger.warning(f"{symbol}: skip close — positions snapshot unavailable")
+                return None
+            if symbol not in positions:
+                logger.warning(f"{symbol}: No open position to close")
+                return None
+            pos = positions[symbol]
+            qty = int(pos["qty"])
+            side = str(pos.get("side") or "BUY").upper()
+            product = str(pos.get("product") or config.INDIA_PRODUCT_TYPE or "INTRADAY")
+            fallback = float(
+                pos.get("current_price") or pos.get("avg_entry_price") or 0
             )
-        else:
-            order_id = self.place_sell_order(
-                symbol, qty, order_type="MARKET", product_type=product
-            )
-        if not order_id:
-            return None
+            if side == "SELL":
+                # Short position -> BUY to cover.
+                order_id = self.place_buy_order(
+                    symbol=symbol,
+                    qty=qty,
+                    limit_price=max(fallback, 0.01),
+                    place_stoploss=False,
+                    stop_loss_price=0.0,
+                    take_profit_price=None,
+                    product_type=product,
+                )
+            else:
+                order_id = self.place_sell_order(
+                    symbol, qty, order_type="MARKET", product_type=product
+                )
+            if not order_id:
+                return None
 
-        if self.paper is not None:
-            # Paper sell id is not a broker order; use mark used by portfolio.
-            fill = fallback
-            try:
-                quote = self.get_latest_quote(symbol)
-                if quote and quote.get("ltp"):
-                    fill = float(quote["ltp"])
-            except Exception:
-                pass
+            if self.paper is not None:
+                # Paper sell id is not a broker order; use mark used by portfolio.
+                fill = fallback
+                try:
+                    quote = self.get_latest_quote(symbol)
+                    if quote and quote.get("ltp"):
+                        fill = float(quote["ltp"])
+                except Exception:
+                    pass
+                self.last_fill_price = fill
+                self.last_fill_qty = qty
+                logger.info(f"Position CLOSED for {symbol} (Qty={qty}) @ {fill:.2f} paper")
+                return fill if fill > 0 else None
+
+            ok, status = self.confirm_live_order(order_id, symbol)
+            if not ok:
+                logger.error(
+                    f"{symbol}: exit order {order_id} not filled ({status}) — "
+                    f"not journaling as closed"
+                )
+                return None
+            filled_qty = int(getattr(self, "last_fill_qty", 0) or 0) or self.get_order_filled_qty(
+                order_id
+            )
+            if filled_qty > 0:
+                self.last_fill_qty = filled_qty
+            fill = self.resolve_exit_fill_price(symbol, order_id, fallback=fallback)
             self.last_fill_price = fill
-            logger.info(f"Position CLOSED for {symbol} (Qty={qty}) @ {fill:.2f} paper")
-            return fill if fill > 0 else None
+            if fill <= 0:
+                logger.warning(
+                    f"Position CLOSE submitted for {symbol} but fill price unknown"
+                )
+                return None
+            logger.info(
+                f"Position CLOSED for {symbol} (Qty={self.last_fill_qty or qty}) @ {fill:.2f}"
+            )
+            return fill
+        finally:
+            order_guards.end_exit(symbol)
+
+    def sync_broker_stop(
+        self,
+        symbol: str,
+        new_stop: float,
+        *,
+        qty: int | None = None,
+        sl_order_id: str | None = None,
+        super_order_id: str | None = None,
+        prev_stop: float | None = None,
+    ) -> bool:
+        """
+        Ratchet broker-side stop to new_stop (never downwards).
+        Uses modify_super_order STOP_LOSS_LEG when super id known, else modify_order
+        on a resting SL order. Returns False if sync not possible / disabled.
+        """
+        if not bool(getattr(config, "SYNC_BROKER_STOPS", False)):
+            return False
+        if self.paper is not None:
+            return True
+        if new_stop is None or float(new_stop) <= 0:
+            return False
+        new_stop = float(round_to_nse_tick(float(new_stop), mode="floor"))
+        if prev_stop is not None and new_stop + 1e-9 < float(prev_stop):
+            logger.info(
+                f"{symbol}: skip broker SL sync — new {new_stop:.2f} < prev {prev_stop:.2f}"
+            )
+            return False
+
+        self.ensure_session()
+        if not self.dhan:
+            return False
 
         try:
-            self.confirm_live_order(order_id, symbol)
-        except Exception as e:
-            logger.debug(f"{symbol}: sell confirm warn: {e}")
-        fill = self.resolve_exit_fill_price(symbol, order_id, fallback=fallback)
-        self.last_fill_price = fill
-        if fill <= 0:
-            logger.warning(
-                f"Position CLOSED for {symbol} (Qty={qty}) but fill price unknown"
+            if super_order_id and hasattr(self.dhan, "modify_super_order"):
+                resp = self.dhan.modify_super_order(
+                    order_id=str(super_order_id),
+                    order_type=getattr(dhanhq, "LIMIT", "LIMIT"),
+                    leg_name="STOP_LOSS_LEG",
+                    stopLossPrice=float(new_stop),
+                    trailingJump=0.0,
+                )
+                ok = self._ok(resp) if hasattr(self, "_ok") else True
+                if ok:
+                    logger.info(
+                        f"{symbol}: broker Super SL synced → {new_stop:.2f} "
+                        f"(order={super_order_id})"
+                    )
+                    return True
+                logger.warning(f"{symbol}: modify_super_order failed: {resp}")
+                return False
+
+            if sl_order_id and hasattr(self.dhan, "modify_order"):
+                trigger = float(new_stop)
+                limit_px = float(round_sell_limit(trigger * 0.995))
+                q = int(qty or 0)
+                resp = self.dhan.modify_order(
+                    order_id=str(sl_order_id),
+                    order_type=getattr(dhanhq, "SL", "SL"),
+                    leg_name="",
+                    quantity=q,
+                    price=limit_px,
+                    trigger_price=trigger,
+                    disclosed_quantity=0,
+                    validity=getattr(dhanhq, "DAY", "DAY"),
+                )
+                ok = self._ok(resp) if hasattr(self, "_ok") else True
+                if ok:
+                    logger.info(
+                        f"{symbol}: broker SL order synced → {new_stop:.2f} "
+                        f"(order={sl_order_id})"
+                    )
+                    return True
+                logger.warning(f"{symbol}: modify_order SL failed: {resp}")
+                return False
+
+            logger.info(
+                f"{symbol}: SYNC_BROKER_STOPS on but no sl/super order id stored — "
+                f"local trail only (cannot safely invent broker modify target)"
             )
-            return None
-        logger.info(f"Position CLOSED for {symbol} (Qty={qty}) @ {fill:.2f}")
-        return fill
+            return False
+        except Exception as e:
+            logger.warning(f"{symbol}: broker stop sync error: {e}")
+            return False
 
     def check_sl_tp(self, risk_mgr) -> list[str]:
         closed_symbols = []
@@ -2003,6 +2203,7 @@ class DhanBroker:
 
                 trailed = risk_mgr.update_trailing_stop(symbol, current_price, atr)
                 if trailed is not None and trailed > sl_price:
+                    prev = sl_price
                     sl_price = trailed
                     if self.paper is not None:
                         self.paper.update_position_meta(
@@ -2013,6 +2214,19 @@ class DhanBroker:
                                 current_price,
                             ),
                         )
+                    else:
+                        meta = getattr(risk_mgr, "_trade_meta", {}).get(symbol) or {}
+                        self.sync_broker_stop(
+                            symbol,
+                            sl_price,
+                            qty=int(pos.get("qty") or meta.get("qty") or 0),
+                            sl_order_id=meta.get("sl_order_id"),
+                            super_order_id=meta.get("super_order_id"),
+                            prev_stop=prev,
+                        )
+                        if meta:
+                            meta["stop"] = sl_price
+                            risk_mgr.persist_state()
 
                 if current_price <= sl_price:
                     reason = "stop_loss"
@@ -2028,6 +2242,9 @@ class DhanBroker:
                     )
 
             if reason:
+                if order_guards.is_exit_inflight(symbol):
+                    logger.info(f"{symbol}: SL/TP skip — exit already in flight")
+                    continue
                 fill = self.close_position(symbol)
                 if fill is not None:
                     closed_symbols.append(symbol)
@@ -2035,8 +2252,13 @@ class DhanBroker:
                     try:
                         import trade_journal
 
+                        qty = int(getattr(self, "last_fill_qty", 0) or pos.get("qty") or 0)
                         trade_journal.record_exit(
-                            "INDIA", symbol, float(fill), reason=reason
+                            "INDIA",
+                            symbol,
+                            float(fill),
+                            reason=reason,
+                            qty=qty if qty > 0 else None,
                         )
                     except Exception as je:
                         logger.debug(f"Journal exit skip: {je}")
@@ -2299,6 +2521,7 @@ class DhanBroker:
         """
         Auto square-off for INTRADAY product before broker cutoff (~15:15 IST).
         Live MIS is also squared off by the broker; this covers paper + soft closes.
+        Verifies broker is flat after each close attempt.
         """
         if (config.INDIA_PRODUCT_TYPE or "CNC").upper() not in ("INTRADAY", "INTRA", "MIS"):
             return []
@@ -2309,15 +2532,44 @@ class DhanBroker:
             return closed
         for symbol in list(positions.keys()):
             fill = self.close_position(symbol)
-            if fill is not None:
+            # Verify flat even if fill unknown (broker may have closed)
+            verify = self.get_open_positions()
+            still_open = bool(verify is not None and symbol in verify)
+            if fill is not None and not still_open:
                 closed.append(symbol)
                 try:
                     import trade_journal
 
+                    qty = int(getattr(self, "last_fill_qty", 0) or 0) or None
                     trade_journal.record_exit(
-                        "INDIA", symbol, float(fill), reason="squareoff"
+                        "INDIA", symbol, float(fill), reason="squareoff", qty=qty
                     )
                 except Exception as je:
                     logger.debug(f"Journal squareoff skip: {je}")
                 logger.warning(f"[INDIA INTRADAY] Auto square-off {symbol} @ {fill:.2f}")
+            elif still_open:
+                logger.error(
+                    f"[INDIA INTRADAY] square-off VERIFY FAILED — {symbol} still open"
+                )
+                # one retry
+                fill2 = self.close_position(symbol)
+                verify2 = self.get_open_positions()
+                if verify2 is not None and symbol not in verify2 and fill2 is not None:
+                    closed.append(symbol)
+                    try:
+                        import trade_journal
+
+                        trade_journal.record_exit(
+                            "INDIA", symbol, float(fill2), reason="squareoff"
+                        )
+                    except Exception:
+                        pass
+                    logger.warning(
+                        f"[INDIA INTRADAY] Auto square-off retry OK {symbol} @ {fill2:.2f}"
+                    )
+            elif fill is not None and verify is None:
+                logger.warning(
+                    f"[INDIA INTRADAY] {symbol} close submitted @ {fill:.2f} "
+                    f"but positions unverifiable"
+                )
         return closed

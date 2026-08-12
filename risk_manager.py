@@ -15,8 +15,12 @@ Capital preservation rules:
 
 from __future__ import annotations
 
+import json
 import logging
-from datetime import datetime
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import config
@@ -53,8 +57,11 @@ class RiskManager:
 
         # Track high-water marks for trailing stops: symbol -> peak price since entry
         self._trail_peaks: dict[str, float] = {}
-        # Track entry + initial stop for R calc: symbol -> {entry, stop, atr}
+        # Track entry + initial stop for R calc: symbol -> {entry, stop, atr, ...}
         self._trade_meta: dict[str, dict] = {}
+        # Pending entry risk (orders submitted, not yet filled/failed): symbol -> ₹ risk
+        self._pending_risk: dict[str, float] = {}
+        self._entry_lock = threading.RLock()
 
         clusters = (
             config.INDIA_CORRELATION_CLUSTERS
@@ -73,6 +80,19 @@ class RiskManager:
             f"ClusterCap={self.max_cluster_positions}, "
             f"DailyDD={self.daily_drawdown_limit:.0%}"
         )
+
+    @contextmanager
+    def entry_gate(self):
+        """Thread-safe gate so Core and Scout cannot both pass risk checks at once."""
+        self._entry_lock.acquire()
+        try:
+            yield
+        finally:
+            self._entry_lock.release()
+
+    def state_path(self) -> Path:
+        journal = Path(str(getattr(config, "TRADE_JOURNAL_PATH", "trade_journal.db")))
+        return journal.expanduser().resolve().parent / f"{self.market.lower()}_trade_state.json"
 
     # -----------------------------------------------------------------------
     # India capital sleeve (INDIA_CAPITAL_CAP)
@@ -198,18 +218,199 @@ class RiskManager:
         entry_price: float,
         stop_loss_price: float,
         atr: float | None = None,
+        *,
+        qty: int | None = None,
+        take_profit: float | None = None,
+        source: str | None = None,
+        strategy: str | None = None,
+        sl_order_id: str | None = None,
+        super_order_id: str | None = None,
+        order_id: str | None = None,
     ):
         self._trade_meta[symbol] = {
-            "entry": entry_price,
-            "stop": stop_loss_price,
+            "entry": float(entry_price),
+            "stop": float(stop_loss_price),
             "atr": atr,
-            "initial_stop": stop_loss_price,
+            "initial_stop": float(stop_loss_price),
+            "qty": int(qty) if qty is not None else None,
+            "take_profit": float(take_profit) if take_profit is not None else None,
+            "source": str(source or ""),
+            "strategy": str(strategy or ""),
+            "sl_order_id": sl_order_id,
+            "super_order_id": super_order_id,
+            "order_id": order_id,
+            "peak": float(entry_price),
         }
-        self._trail_peaks[symbol] = entry_price
+        self._trail_peaks[symbol] = float(entry_price)
+        self.clear_pending_risk(symbol)
+        self.persist_state()
 
     def clear_trade(self, symbol: str):
         self._trade_meta.pop(symbol, None)
         self._trail_peaks.pop(symbol, None)
+        self.clear_pending_risk(symbol)
+        self.persist_state()
+
+    def set_pending_risk(self, symbol: str, risk_rupees: float) -> None:
+        sym = str(symbol).upper()
+        with self._entry_lock:
+            if risk_rupees > 0:
+                self._pending_risk[sym] = float(risk_rupees)
+            else:
+                self._pending_risk.pop(sym, None)
+
+    def clear_pending_risk(self, symbol: str) -> None:
+        with self._entry_lock:
+            self._pending_risk.pop(str(symbol).upper(), None)
+
+    def portfolio_risk_budget_rupees(self, equity: float) -> float:
+        """Max open+pending risk ≈ daily drawdown budget on the sizing sleeve."""
+        base = self.effective_equity(equity) if self.market == "INDIA" else float(equity or 0)
+        return max(0.0, float(base) * float(self.daily_drawdown_limit))
+
+    def open_risk_rupees(self, positions: dict | None = None) -> float:
+        total = 0.0
+        # Prefer live meta; fall back to position marks
+        meta_syms = set(self._trade_meta.keys())
+        for symbol, meta in self._trade_meta.items():
+            entry = float(meta.get("entry") or 0)
+            stop = float(meta.get("stop") or meta.get("initial_stop") or 0)
+            qty = int(meta.get("qty") or 0)
+            if positions and symbol in positions:
+                qty = int(positions[symbol].get("qty") or qty or 0)
+            if entry <= 0 or qty <= 0:
+                continue
+            total += max(entry - stop, 0.0) * qty
+        if positions:
+            for symbol, pos in positions.items():
+                if symbol in meta_syms:
+                    continue
+                entry = float(pos.get("avg_entry_price") or 0)
+                qty = int(pos.get("qty") or 0)
+                if entry <= 0 or qty <= 0:
+                    continue
+                stop = self.get_effective_stop(symbol, entry)
+                total += max(entry - stop, 0.0) * qty
+        return total
+
+    def pending_risk_rupees(self) -> float:
+        with self._entry_lock:
+            return float(sum(self._pending_risk.values()))
+
+    def can_add_trade_risk(
+        self,
+        equity: float,
+        new_risk_rupees: float,
+        positions: dict | None = None,
+    ) -> tuple[bool, str]:
+        """
+        True if open risk + pending risk + new trade risk <= portfolio/daily budget.
+        Must be called under entry_gate for Core/Scout atomicity.
+        """
+        budget = self.portfolio_risk_budget_rupees(equity)
+        if budget <= 0:
+            return True, ""
+        open_r = self.open_risk_rupees(positions)
+        pend_r = self.pending_risk_rupees()
+        total = open_r + pend_r + max(0.0, float(new_risk_rupees))
+        if total > budget + 1e-6:
+            return (
+                False,
+                f"portfolio_risk ₹{total:,.0f} > budget ₹{budget:,.0f} "
+                f"(open={open_r:,.0f} pending={pend_r:,.0f} new={new_risk_rupees:,.0f})",
+            )
+        return True, ""
+
+    def persist_state(self) -> None:
+        if self.market != "INDIA":
+            return
+        try:
+            path = self.state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "trade_meta": self._trade_meta,
+                "trail_peaks": self._trail_peaks,
+  "saved_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:
+            logger.debug(f"persist trade state skipped: {e}")
+
+    def load_state(self) -> None:
+        if self.market != "INDIA":
+            return
+        path = self.state_path()
+        if not path.is_file():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            meta = raw.get("trade_meta") or {}
+            peaks = raw.get("trail_peaks") or {}
+            if isinstance(meta, dict):
+                self._trade_meta = {str(k): dict(v) for k, v in meta.items() if isinstance(v, dict)}
+            if isinstance(peaks, dict):
+                self._trail_peaks = {str(k): float(v) for k, v in peaks.items()}
+            logger.info(
+                f"RiskManager[{self.market}] restored meta for "
+                f"{len(self._trade_meta)} symbols from {path}"
+            )
+        except Exception as e:
+            logger.warning(f"load trade state failed: {e}")
+
+    def reconcile_meta_with_broker(self, broker_positions: dict | None) -> None:
+        """
+        Keep meta only for symbols actually open at the broker.
+        Do not invent positions from stale local state.
+        """
+        if broker_positions is None:
+            return
+        live = {str(s) for s in broker_positions.keys()}
+        stale = [s for s in list(self._trade_meta.keys()) if s not in live]
+        for s in stale:
+            self._trade_meta.pop(s, None)
+            self._trail_peaks.pop(s, None)
+        for symbol, pos in broker_positions.items():
+            if symbol in self._trade_meta:
+                meta = self._trade_meta[symbol]
+                meta["qty"] = int(pos.get("qty") or meta.get("qty") or 0)
+                entry = float(pos.get("avg_entry_price") or 0)
+                if entry > 0:
+                    meta["entry"] = entry
+                continue
+            # Broker-open without meta: reconstruct conservative SL/TP from pct/ATR if present
+            entry = float(pos.get("avg_entry_price") or 0)
+            qty = int(pos.get("qty") or 0)
+            if entry <= 0 or qty <= 0:
+                continue
+            atr = pos.get("atr")
+            try:
+                atr_f = float(atr) if atr is not None else None
+            except (TypeError, ValueError):
+                atr_f = None
+            sl = self.get_stop_loss_price(entry, atr_f)
+            tp = self.get_take_profit_price(entry, stop_loss_price=sl, atr=atr_f)
+            self._trade_meta[symbol] = {
+                "entry": entry,
+                "stop": sl,
+                "atr": atr_f,
+                "initial_stop": sl,
+                "qty": qty,
+                "take_profit": tp,
+                "source": "broker_reconcile",
+                "strategy": "",
+                "sl_order_id": None,
+                "super_order_id": None,
+                "order_id": None,
+                "peak": entry,
+            }
+            self._trail_peaks[symbol] = entry
+            logger.warning(
+                f"{symbol}: reconstructed local SL/TP after restart "
+                f"(entry={entry:.2f} sl={sl:.2f}) — verify broker stop still armed"
+            )
+        self.persist_state()
 
     def update_trailing_stop(
         self,
@@ -220,6 +421,7 @@ class RiskManager:
         """
         After price moves in favor, trail stop at peak − ATR_TRAIL_MULT × ATR.
         Returns the effective stop (max of initial SL and trail), or None if unknown.
+        Never loosens below the current stored stop.
         """
         meta = self._trade_meta.get(symbol)
         if not meta:
@@ -227,22 +429,26 @@ class RiskManager:
 
         peak = max(self._trail_peaks.get(symbol, meta["entry"]), current_price)
         self._trail_peaks[symbol] = peak
+        meta["peak"] = peak
 
         use_atr = atr if (atr and atr > 0) else meta.get("atr")
         initial_stop = meta["initial_stop"]
+        prev_stop = float(meta.get("stop") or initial_stop)
 
         # Only start trailing once we've moved at least 1R in favor
         risk = meta["entry"] - initial_stop
         if risk <= 0 or (peak - meta["entry"]) < risk:
-            return initial_stop
+            return prev_stop
 
         if use_atr and use_atr > 0:
             trail = round(peak - (self.atr_trail_mult * use_atr), 2)
         else:
             trail = round(peak * (1 - self.stop_loss_pct), 2)
 
-        effective = max(initial_stop, trail)
+        # Never loosen vs initial OR vs already-ratcheted stop
+        effective = max(initial_stop, prev_stop, trail)
         meta["stop"] = effective
+        self.persist_state()
         return effective
 
     def get_effective_stop(self, symbol: str, entry_price: float, atr: float | None = None) -> float:
@@ -437,15 +643,16 @@ class RiskManager:
             )
             return True
 
-        prev_reason = bot_state.kill_switch_reason(self.market)
-        if bot_state.is_kill_switch_active(self.market) and (
-            prev_reason.startswith("daily_drawdown") or prev_reason == "invalid_sod"
-        ):
-            bot_state.reset_kill_switch(self.market)
-            logger.warning(
-                f"[{self.market}] Kill switch cleared — drawdown {drawdown:.2%} "
-                f"within limit ({dd_note})"
-            )
+        # Latch: once daily_drawdown trips, do NOT auto-clear on recovery.
+        # Reset only on next trading day via reset_kill_switch().
+        if bot_state.is_kill_switch_active(self.market):
+            prev_reason = bot_state.kill_switch_reason(self.market)
+            if prev_reason.startswith("daily_drawdown") or prev_reason == "invalid_sod":
+                logger.warning(
+                    f"[{self.market}] Kill switch still latched ({prev_reason}) — "
+                    f"current DD {drawdown:.2%} ({dd_note})"
+                )
+                return True
 
         logger.info(
             f"Daily drawdown: {drawdown:.2%} "

@@ -317,6 +317,7 @@ def rank_near_setups(
 ) -> list[dict[str, Any]]:
     """
     Sort by score desc for the Near Setups panel.
+    INDIA_SCOUT_MIN_SCORE filters this dashboard ranking only (not live ORB buys).
     By default excludes full would_buy confirmations (those trade via scout loop).
     """
     n = top_n if top_n is not None else config.INDIA_SCOUT_TOP_N

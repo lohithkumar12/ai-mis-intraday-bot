@@ -91,6 +91,12 @@ def record_entry(
     meta: dict | None = None,
 ) -> int:
     now = datetime.now(timezone.utc).isoformat()
+    meta_out = dict(meta or {})
+    src = str(meta_out.get("source") or "").lower()
+    if not src:
+        src = "scout" if str(reason).startswith("scout") else "core"
+        meta_out["source"] = src
+    meta_out.setdefault("entry_reason", reason or "")
     with _lock, _conn() as conn:
         cur = conn.execute(
             """
@@ -110,12 +116,13 @@ def record_entry(
                 reason,
                 strategy,
                 now,
-                json.dumps(meta or {}),
+                json.dumps(meta_out),
             ),
         )
         trade_id = int(cur.lastrowid)
     logger.info(
-        f"[JOURNAL] ENTRY #{trade_id} {market} {symbol} qty={qty} @ {entry_price:.2f}"
+        f"[JOURNAL] ENTRY #{trade_id} {market} {symbol} qty={qty} @ {entry_price:.2f} "
+        f"source={src} reason={reason}"
     )
     return trade_id
 
@@ -151,16 +158,34 @@ def record_exit(
         else:
             pnl = (exit_price - entry) * q
             pnl_pct = ((exit_price - entry) / entry) if entry else 0.0
-        reason_final = reason or row["reason"] or "exit"
+        entry_reason = row["reason"] or ""
+        try:
+            meta = json.loads(row["meta_json"] or "{}")
+        except Exception:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.setdefault("entry_reason", entry_reason)
+        meta["exit_reason"] = reason or entry_reason or "exit"
+        reason_final = reason or entry_reason or "exit"
 
         conn.execute(
             """
             UPDATE trades SET
                 exit_price=?, pnl=?, pnl_pct=?, reason=?,
-                status='closed', closed_at=?, qty=?
+                status='closed', closed_at=?, qty=?, meta_json=?
             WHERE id=?
             """,
-            (exit_price, pnl, pnl_pct, reason_final, now, q, row["id"]),
+            (
+                exit_price,
+                pnl,
+                pnl_pct,
+                reason_final,
+                now,
+                q,
+                json.dumps(meta),
+                row["id"],
+            ),
         )
         result = {
             "id": row["id"],
@@ -175,10 +200,13 @@ def record_exit(
             "pnl": pnl,
             "pnl_pct": pnl_pct,
             "reason": reason_final,
+            "entry_reason": meta.get("entry_reason"),
+            "source": meta.get("source"),
         }
     logger.info(
         f"[JOURNAL] EXIT #{result['id']} {market} {symbol} "
-        f"PnL={pnl:+.2f} ({pnl_pct:+.2%}) reason={reason_final}"
+        f"PnL={pnl:+.2f} ({pnl_pct:+.2%}) reason={reason_final} "
+        f"source={result.get('source')}"
     )
     return result
 

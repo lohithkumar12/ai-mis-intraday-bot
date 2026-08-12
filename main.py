@@ -9,6 +9,7 @@ Dashboard stays alive around the clock; trades only during market hours.
 """
 
 import logging
+import json
 import os
 import sys
 import time
@@ -140,11 +141,14 @@ def _india_try_buy(
     tradable_window: bool,
     regime_ok: bool,
     reason: str = "signal_buy",
+    source: str = "core",
 ) -> bool:
     """
     Shared India equity BUY path (core + scout). Honors session/regime/risk caps.
-    Returns True if an order was accepted.
+    Returns True only after a confirmed TRADED/PART_TRADED fill.
     """
+    source = "scout" if str(source).lower() == "scout" or str(reason).startswith("scout") else "core"
+
     if not tradable_window:
         logger.info(f"{symbol}: BUY skipped — outside tradable session window")
         return False
@@ -153,8 +157,6 @@ def _india_try_buy(
         return False
     if risk_mgr.is_kill_switch_active:
         logger.info(f"{symbol}: BUY skipped — kill switch active")
-        return False
-    if not risk_mgr.is_position_allowed(symbol, current_positions):
         return False
 
     blocked, block_reason = order_guards.is_buy_blocked(symbol)
@@ -194,62 +196,172 @@ def _india_try_buy(
         )
         return False
 
-    order_id = india_broker.place_buy_order(
-        symbol=symbol,
-        qty=qty,
-        limit_price=limit_price,
-        stop_loss_price=sl,
-        take_profit_price=tp,
-        atr=atr,
-    )
-    if not order_id:
-        logger.warning(
-            f"{symbol}: BUY order failed — "
-            f"{getattr(india_broker, 'last_error', 'unknown')}"
+    new_risk = max(stop_dist, 0.0) * qty
+
+    # Atomic Core/Scout gate: position limits + portfolio risk + symbol reservation
+    with risk_mgr.entry_gate():
+        if not risk_mgr.is_position_allowed(symbol, current_positions):
+            return False
+        ok_risk, risk_why = risk_mgr.can_add_trade_risk(
+            sizing_equity, new_risk, current_positions
         )
-        # Broker may already have set reject cooldown; ensure one exists.
-        err = str(getattr(india_broker, "last_error", "") or "")
-        if "reject" in err.lower() or "16283" in err or "tick" in err.lower():
-            order_guards.block_buy_after_reject(symbol, err[:160])
-        return False
+        if not ok_risk:
+            logger.info(f"{symbol}: BUY skipped — {risk_why}")
+            return False
+        reserved, res_why = order_guards.try_reserve_buy(symbol, owner=source)
+        if not reserved:
+            logger.info(f"{symbol}: BUY skipped — {res_why}")
+            return False
+        risk_mgr.set_pending_risk(symbol, new_risk)
 
-    # Prefer Dhan BUY fill for journal/risk; fall back to limit only if unknown.
-    entry_px = float(getattr(india_broker, "last_fill_price", 0) or 0)
-    if entry_px <= 0 and hasattr(india_broker, "resolve_entry_fill_price"):
-        try:
-            entry_px = float(
-                india_broker.resolve_entry_fill_price(
-                    symbol, order_id, fallback=limit_price
-                )
-                or 0
+    order_id = None
+    try:
+        order_id = india_broker.place_buy_order(
+            symbol=symbol,
+            qty=qty,
+            limit_price=limit_price,
+            stop_loss_price=sl,
+            take_profit_price=tp,
+            atr=atr,
+        )
+        if not order_id:
+            logger.warning(
+                f"{symbol}: BUY order failed — "
+                f"{getattr(india_broker, 'last_error', 'unknown')}"
             )
-        except Exception:
-            entry_px = 0.0
-    if entry_px <= 0:
-        entry_px = float(limit_price)
+            err = str(getattr(india_broker, "last_error", "") or "")
+            if "reject" in err.lower() or "16283" in err or "tick" in err.lower():
+                order_guards.block_buy_after_reject(symbol, err[:160])
+            return False
 
-    # ORB (and wrappers): lock day-fire only after confirmed order acceptance/fill.
-    if hasattr(strategy, "mark_day_fired"):
+        # place_buy_order only returns id after TRADED/PART_TRADED confirmation.
+        fill_qty = int(getattr(india_broker, "last_fill_qty", 0) or 0)
+        if fill_qty <= 0:
+            fill_qty = int(qty)
+        entry_px = float(getattr(india_broker, "last_fill_price", 0) or 0)
+        if entry_px <= 0 and hasattr(india_broker, "resolve_entry_fill_price"):
+            try:
+                entry_px = float(
+                    india_broker.resolve_entry_fill_price(
+                        symbol, order_id, fallback=limit_price
+                    )
+                    or 0
+                )
+            except Exception:
+                entry_px = 0.0
+        if entry_px <= 0:
+            entry_px = float(limit_price)
+
+        # Recompute SL/TP from actual fill (risk distance preserved via ATR when possible)
+        sl = risk_mgr.get_stop_loss_price(entry_px, atr)
+        tp = risk_mgr.get_take_profit_price(entry_px, stop_loss_price=sl, atr=atr)
+
+        if hasattr(strategy, "mark_day_fired"):
+            try:
+                strategy.mark_day_fired(symbol, "BUY")
+            except Exception as me:
+                logger.debug(f"{symbol}: mark_day_fired skipped: {me}")
+
+        risk_mgr.register_trade(
+            symbol,
+            entry_px,
+            sl,
+            atr,
+            qty=fill_qty,
+            take_profit=tp,
+            source=source,
+            strategy=getattr(strategy, "name", ""),
+            sl_order_id=getattr(india_broker, "last_sl_order_id", None),
+            super_order_id=getattr(india_broker, "last_super_order_id", None),
+            order_id=order_id,
+        )
+        trade_journal.record_entry(
+            "INDIA",
+            symbol,
+            fill_qty,
+            entry_px,
+            stop_price=sl,
+            take_profit=tp,
+            reason=reason,
+            strategy=strategy.name,
+            meta={
+                "atr": atr,
+                "order_id": order_id,
+                "limit_price": limit_price,
+                "source": source,
+                "entry_reason": reason,
+                "intended_qty": qty,
+                "fill_status": getattr(india_broker, "last_order_status", ""),
+            },
+        )
+        alerts.trade_alert(
+            "INDIA", "BUY", symbol, f"qty={fill_qty} @{entry_px} src={source}"
+        )
+        current_positions[symbol] = {
+            "qty": fill_qty,
+            "avg_entry_price": entry_px,
+        }
+        return True
+    finally:
+        risk_mgr.clear_pending_risk(symbol)
+        order_guards.release_buy_reservation(symbol)
+
+
+def _india_restore_runtime_state(india_broker, risk_mgr, strategy) -> None:
+    """Load persisted meta / ORB locks and reconcile against live broker positions."""
+    try:
+        risk_mgr.load_state()
+    except Exception as e:
+        logger.debug(f"risk state load: {e}")
+    if strategy is not None and hasattr(strategy, "load_fired_state"):
         try:
-            strategy.mark_day_fired(symbol, "BUY")
-        except Exception as me:
-            logger.debug(f"{symbol}: mark_day_fired skipped: {me}")
-
-    risk_mgr.register_trade(symbol, entry_px, sl, atr)
-    trade_journal.record_entry(
-        "INDIA",
-        symbol,
-        qty,
-        entry_px,
-        stop_price=sl,
-        take_profit=tp,
-        reason=reason,
-        strategy=strategy.name,
-        meta={"atr": atr, "order_id": order_id, "limit_price": limit_price},
+            strategy.load_fired_state()
+        except Exception as e:
+            logger.debug(f"ORB fired load: {e}")
+    try:
+        positions = india_broker.get_open_positions()
+    except Exception as e:
+        logger.warning(f"[INDIA] startup positions fetch failed: {e}")
+        return
+    if positions is None:
+        logger.warning(
+            "[INDIA] startup reconcile skipped — positions unavailable "
+            "(will not invent opens from journal)"
+        )
+        return
+    risk_mgr.reconcile_meta_with_broker(positions)
+    # Journal opens not on broker → broker_flat; never create broker positions from journal
+    _reconcile_india_journal(india_broker, risk_mgr, positions)
+    # Enrich meta from open journal rows when broker has the symbol
+    try:
+        for row in trade_journal.list_open_trades("INDIA"):
+            sym = str(row.get("symbol") or "")
+            if not sym or sym not in positions:
+                continue
+            meta = risk_mgr._trade_meta.get(sym) or {}
+            try:
+                jmeta = json.loads(row.get("meta_json") or "{}")
+            except Exception:
+                jmeta = {}
+            if not meta.get("source") and jmeta.get("source"):
+                meta["source"] = jmeta.get("source")
+            if row.get("stop_price") and not meta.get("initial_stop"):
+                meta["initial_stop"] = float(row["stop_price"])
+                meta["stop"] = float(row["stop_price"])
+            if row.get("take_profit"):
+                meta["take_profit"] = float(row["take_profit"])
+            meta["qty"] = int(positions[sym].get("qty") or row.get("qty") or 0)
+            meta["entry"] = float(
+                positions[sym].get("avg_entry_price") or row.get("entry_price") or 0
+            )
+            risk_mgr._trade_meta[sym] = meta
+        risk_mgr.persist_state()
+    except Exception as e:
+        logger.debug(f"journal enrich meta skip: {e}")
+    logger.info(
+        f"[INDIA] Startup reconcile done | broker_open={list(positions.keys())} "
+        f"| meta={list(risk_mgr._trade_meta.keys())}"
     )
-    alerts.trade_alert("INDIA", "BUY", symbol, f"qty={qty} @{entry_px}")
-    current_positions[symbol] = {"qty": qty}
-    return True
 
 
 def _india_try_sell(
@@ -261,12 +373,18 @@ def _india_try_sell(
 ) -> bool:
     if symbol not in current_positions:
         return False
+    if order_guards.is_exit_inflight(symbol):
+        logger.info(f"{symbol}: SELL skipped — exit already in flight")
+        return False
     pos = current_positions[symbol]
     fallback = float(pos.get("current_price") or pos.get("avg_entry_price") or 0)
     fill = india_broker.close_position(symbol)
     if fill is not None:
         px = float(fill) if float(fill) > 0 else fallback
-        trade_journal.record_exit("INDIA", symbol, px, reason="signal_sell")
+        qty = int(getattr(india_broker, "last_fill_qty", 0) or pos.get("qty") or 0) or None
+        trade_journal.record_exit(
+            "INDIA", symbol, px, reason="signal_sell", qty=qty
+        )
         risk_mgr.clear_trade(symbol)
         alerts.trade_alert("INDIA", "SELL", symbol, f"@{px}")
         current_positions.pop(symbol, None)
@@ -376,6 +494,7 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
         f"[INDIA] Ready | Mode={'PAPER SIM + live NSE data' if paper else 'LIVE REAL MONEY'} "
         f"| Strategy={strategy.name}"
     )
+    _india_restore_runtime_state(india_broker, risk_mgr, strategy)
 
     while True:
         try:
@@ -566,6 +685,7 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                         tradable_window=tradable_window,
                         regime_ok=regime_ok,
                         reason="signal_buy",
+                        source="core",
                     )
 
                 elif signal == "SELL":
@@ -660,6 +780,8 @@ def run_india_scout_loop(strategy, risk_mgr, rs_filter=None):
         f"interval={interval}s | near_top_n={config.INDIA_SCOUT_TOP_N} | "
         f"rs_top_n={rs_n} | auto_buy={auto_buy} | Mode={'PAPER' if paper else 'LIVE'}"
     )
+    # Shared risk_mgr already restored by core loop; refresh broker reconcile once here too
+    _india_restore_runtime_state(india_broker, risk_mgr, strategy)
 
     while True:
         try:
@@ -774,6 +896,7 @@ def run_india_scout_loop(strategy, risk_mgr, rs_filter=None):
                         tradable_window=tradable_window,
                         regime_ok=regime_ok,
                         reason="scout_signal_buy",
+                        source="scout",
                     ):
                         buys += 1
                 elif signal == "SELL":

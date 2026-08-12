@@ -336,6 +336,7 @@ class TestOrbFireAfterFill(unittest.TestCase):
             strat = OpeningRangeBreakoutStrategy(params_for_market("INDIA"))
             strat.use_htf = False
             strat.volume_mult = 0.0
+            strat._fired = {}
             df = strat.compute_indicators(self._orb_breakout_df())
 
             sig1 = strat.generate_signal(df, "RELIANCE")

@@ -62,11 +62,14 @@ class TestIndiaCapitalCap(unittest.TestCase):
                 self.assertTrue(tripped2)
                 self.assertTrue(rm.is_kill_switch_active)
 
-                # Recovery under limit auto-clears daily_drawdown latch
+                # Recovery under limit must NOT auto-clear daily_drawdown latch
                 tripped3 = rm.check_daily_drawdown(
                     300_000, 355_000, day_pl=-500.0
                 )
-                self.assertFalse(tripped3)
+                self.assertTrue(tripped3)
+                self.assertTrue(rm.is_kill_switch_active)
+                # Explicit next-day reset clears it
+                rm.reset_kill_switch()
                 self.assertFalse(rm.is_kill_switch_active)
 
     def test_kill_switch_shared_loop_and_dashboard(self):

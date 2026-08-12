@@ -19,10 +19,12 @@ Same interface for India (and US if enabled); params from market-specific config
 
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -475,6 +477,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         self.htf_ema = int(getattr(config, "ORB_HTF_EMA_PERIOD", 20) or 20)
         # Day-key → side only after a confirmed broker fill (not on bare signal).
         self._fired: dict[str, str] = {}
+        self.load_fired_state()
         logger.info(
             f"[{params.market}] ORB | or={self.or_minutes}m confirm={config.CONFIRM_BARS} "
             f"vol_mult={self.volume_mult} htf_ema={self.htf_ema if self.use_htf else 'off'}"
@@ -498,6 +501,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         key = self._fire_key(symbol, day=day)
         self._fired[key] = side_u
         logger.info(f"[ORB] marked fired {key}={side_u} (after confirmed fill)")
+        self._persist_fired()
 
     def has_day_fired(self, symbol: str, side: str | None = None, day=None) -> bool:
         key = self._fire_key(symbol, day=day)
@@ -507,6 +511,85 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         if side is None:
             return True
         return got == str(side).upper()
+
+    def _fired_state_path(self) -> Path:
+        journal = Path(str(getattr(config, "TRADE_JOURNAL_PATH", "trade_journal.db")))
+        return journal.expanduser().resolve().parent / "orb_day_fired.json"
+
+    def _persist_fired(self) -> None:
+        try:
+            path = self._fired_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Drop keys from prior calendar days
+            try:
+                from zoneinfo import ZoneInfo
+                today = str(datetime.now(ZoneInfo("Asia/Kolkata")).date())
+            except Exception:
+                today = str(datetime.now(timezone.utc).date())
+            # keys are SYMBOL:date — keep only today
+            keep = {k: v for k, v in self._fired.items() if str(k).split(":")[-1] == today}
+            self._fired = keep
+            path.write_text(json.dumps(self._fired), encoding="utf-8")
+        except Exception as e:
+            logger.debug(f"ORB fired persist skip: {e}")
+
+    def load_fired_state(self) -> None:
+        try:
+            path = self._fired_state_path()
+            if not path.is_file():
+                return
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self._fired = {str(k): str(v) for k, v in raw.items()}
+                self._persist_fired()  # prune old days
+                logger.info(f"[ORB] restored {len(self._fired)} day-fired locks")
+        except Exception as e:
+            logger.debug(f"ORB fired load skip: {e}")
+
+    @staticmethod
+    def _timeframe_minutes() -> int:
+        raw = str(getattr(config, "TIMEFRAME", "5") or "5").strip().lower()
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        try:
+            return max(1, int(digits or "5"))
+        except Exception:
+            return 5
+
+    def completed_bars_only(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Drop the currently forming candle so ORB never uses live close/volume.
+        Bars whose period end is still in the future (IST) are excluded.
+        """
+        if df is None or df.empty:
+            return df
+        try:
+            from zoneinfo import ZoneInfo
+            ist = ZoneInfo("Asia/Kolkata")
+        except ImportError:
+            import pytz  # type: ignore
+            ist = pytz.timezone("Asia/Kolkata")
+
+        now = datetime.now(ist)
+        tf_m = self._timeframe_minutes()
+        idx = df.index
+        if getattr(idx, "tz", None) is None:
+            local = idx.tz_localize(ist)
+        else:
+            local = idx.tz_convert(ist)
+        # Bar labeled T covers [T, T+tf). Complete when now >= T+tf.
+        complete_mask = [
+            (ts.to_pydatetime() + timedelta(minutes=tf_m)) <= now for ts in local
+        ]
+        mask = pd.Series(complete_mask, index=df.index)
+        out = df.loc[mask]
+        if out.empty and len(df) > 1:
+            # Clock skew / tz edge: still refuse the last row as forming
+            return df.iloc[:-1]
+        if len(out) == len(df) and len(df) > 0:
+            last_end = local[-1].to_pydatetime() + timedelta(minutes=tf_m)
+            if now < last_end:
+                return df.iloc[:-1]
+        return out if not out.empty else df.iloc[:-1]
 
     def _session_date(self, ts) -> object:
         try:
@@ -556,6 +639,11 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             return "HOLD"
         if "VOL_AVG" not in df.columns:
             df = self.compute_indicators(df)
+
+        # Never use the forming candle for ORB confirm / volume / HTF bias.
+        df = self.completed_bars_only(df)
+        if df is None or len(df) < need:
+            return "HOLD"
 
         latest = df.iloc[-1]
         ts = df.index[-1]

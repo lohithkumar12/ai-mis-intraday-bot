@@ -38,6 +38,7 @@ class TestConfirmLiveOrder(unittest.TestCase):
         broker.get_order_status = MagicMock(
             return_value=("REJECTED", "EXCH:16283 tick size")
         )
+        broker.get_order_filled_qty = MagicMock(return_value=0)
         ok, detail = broker.confirm_live_order("oid1", "DIVISLAB", timeout_sec=1.0)
         self.assertFalse(ok)
         self.assertIn("REJECTED", detail)
@@ -50,6 +51,7 @@ class TestConfirmLiveOrder(unittest.TestCase):
         broker.paper = None
         broker.last_error = ""
         broker.get_order_status = MagicMock(return_value=("TRADED", "TRADED"))
+        broker.get_order_filled_qty = MagicMock(return_value=1)
         ok, detail = broker.confirm_live_order("oid2", "INFY", timeout_sec=1.0)
         self.assertTrue(ok)
         self.assertEqual(detail, "TRADED")

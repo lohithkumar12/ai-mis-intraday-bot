@@ -320,8 +320,12 @@ ALLOW_MARKET_ENTRIES: bool = _env_bool("ALLOW_MARKET_ENTRIES", "false")
 
 
 
-# Sync software trailing stops onto broker stop orders
+# Sync software trailing stops onto broker stop orders when an SL/super order id
+# is known (modify_order / modify_super_order). Never loosens. If no order id is
+# stored after restart, local trail still runs but broker sync is skipped.
 SYNC_BROKER_STOPS: bool = _env_bool("SYNC_BROKER_STOPS", "true")
+# TTL for Core/Scout buy reservation lock (seconds)
+BUY_RESERVE_TTL_SEC: float = _env_float("BUY_RESERVE_TTL_SEC", "45")
 
 # Multi-timeframe / regime — softer defaults for MIS ORB (optional)
 USE_MTF_FILTER: bool = _env_bool("USE_MTF_FILTER", "false")
