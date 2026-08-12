@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -244,6 +244,100 @@ class TestLatestSellFillPrice(unittest.TestCase):
         self.broker.get_latest_quote = MagicMock(return_value={"ltp": 1190.0})
         px = self.broker.resolve_exit_fill_price("INFY", None, fallback=1189.10)
         self.assertAlmostEqual(px, 1186.40)
+
+    def test_latest_buy_fill_from_trade_book(self):
+        self.broker._list_trade_book_rows = MagicMock(
+            return_value=[
+                {
+                    "transactionType": "BUY",
+                    "tradingSymbol": "SBIN-EQ",
+                    "tradedPrice": 1082.15,
+                    "exchangeTime": "2026-08-12 09:45:00",
+                },
+                {
+                    "transactionType": "SELL",
+                    "tradingSymbol": "SBIN-EQ",
+                    "tradedPrice": 1081.0,
+                    "exchangeTime": "2026-08-12 10:15:00",
+                },
+            ]
+        )
+        self.broker._list_order_rows = MagicMock(return_value=[])
+        self.assertAlmostEqual(self.broker.latest_buy_fill_price("SBIN"), 1082.15)
+
+    def test_resolve_entry_prefers_order_fill(self):
+        self.broker.get_order_fill_price = MagicMock(return_value=1082.25)
+        self.broker.latest_buy_fill_price = MagicMock(return_value=1082.0)
+        self.broker.get_latest_quote = MagicMock(return_value={"ltp": 1083.0})
+        px = self.broker.resolve_entry_fill_price("SBIN", "oid-1", fallback=1080.0)
+        self.assertAlmostEqual(px, 1082.25)
+
+
+class TestOrbFireAfterFill(unittest.TestCase):
+    def _orb_breakout_df(self):
+        """Minimal IST 5m bars: OR 09:15–09:30, then close above OR high."""
+        import pandas as pd
+        from zoneinfo import ZoneInfo
+
+        ist = ZoneInfo("Asia/Kolkata")
+        # 09:15, 09:20, 09:25 = OR (high=100); then 09:30+ breakout closes at 101
+        times = [
+            datetime(2026, 8, 12, 9, 15, tzinfo=ist),
+            datetime(2026, 8, 12, 9, 20, tzinfo=ist),
+            datetime(2026, 8, 12, 9, 25, tzinfo=ist),
+            datetime(2026, 8, 12, 9, 30, tzinfo=ist),
+            datetime(2026, 8, 12, 9, 35, tzinfo=ist),
+        ]
+        # Need enough history for ATR/EMA — prepend flat bars
+        pre = [datetime(2026, 8, 11, 12, 0, tzinfo=ist) + timedelta(minutes=5 * i) for i in range(40)]
+        idx = pre + times
+        n = len(idx)
+        close = [99.0] * 40 + [99.0, 99.5, 100.0, 101.0, 101.5]
+        high = [c + 0.2 for c in close]
+        # OR bars need high peaking at 100
+        high[40] = 100.0
+        high[41] = 100.0
+        high[42] = 100.0
+        low = [c - 0.2 for c in close]
+        open_ = list(close)
+        vol = [2_000_000.0] * n
+        return pd.DataFrame(
+            {"open": open_, "high": high, "low": low, "close": close, "volume": vol},
+            index=pd.DatetimeIndex(idx),
+        )
+
+    def test_signal_does_not_lock_until_mark_day_fired(self):
+        from strategy import OpeningRangeBreakoutStrategy, params_for_market
+        import config as cfg
+
+        old_htf = cfg.ORB_USE_HTF_FILTER
+        old_vol = cfg.VOLUME_MULT
+        old_confirm = cfg.CONFIRM_BARS
+        try:
+            cfg.ORB_USE_HTF_FILTER = False
+            cfg.VOLUME_MULT = 0.0
+            cfg.CONFIRM_BARS = 1
+            strat = OpeningRangeBreakoutStrategy(params_for_market("INDIA"))
+            strat.use_htf = False
+            strat.volume_mult = 0.0
+            df = strat.compute_indicators(self._orb_breakout_df())
+
+            sig1 = strat.generate_signal(df, "RELIANCE")
+            self.assertEqual(sig1, "BUY")
+            self.assertFalse(strat.has_day_fired("RELIANCE", "BUY"))
+
+            # Still BUY on next call — not locked by bare signal
+            sig2 = strat.generate_signal(df, "RELIANCE")
+            self.assertEqual(sig2, "BUY")
+
+            strat.mark_day_fired("RELIANCE", "BUY")
+            self.assertTrue(strat.has_day_fired("RELIANCE", "BUY"))
+            sig3 = strat.generate_signal(df, "RELIANCE")
+            self.assertEqual(sig3, "HOLD")
+        finally:
+            cfg.ORB_USE_HTF_FILTER = old_htf
+            cfg.VOLUME_MULT = old_vol
+            cfg.CONFIRM_BARS = old_confirm
 
 
 if __name__ == "__main__":

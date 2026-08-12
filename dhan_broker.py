@@ -1188,11 +1188,19 @@ class DhanBroker:
         return []
 
     def latest_sell_fill_price(self, symbol: str) -> float:
-        """
-        Latest today's SELL (incl. SL) fill for symbol from Dhan trade book / order list.
+        """Latest today's SELL (incl. SL) fill for symbol. Returns 0 if unknown."""
+        return self._latest_side_fill_price(symbol, "SELL")
 
-        Prefer trade-book tradedPrice (actual executions), then order-book
-        averageTradedPrice for TRADED/PART_TRADED SELL orders. Returns 0 if unknown.
+    def latest_buy_fill_price(self, symbol: str) -> float:
+        """Latest today's BUY fill for symbol. Returns 0 if unknown."""
+        return self._latest_side_fill_price(symbol, "BUY")
+
+    def _latest_side_fill_price(self, symbol: str, side: str) -> float:
+        """
+        Latest today's fill for symbol+side from Dhan trade book / order list.
+
+        Prefer trade-book tradedPrice, then order-book averageTradedPrice for
+        TRADED/PART_TRADED orders. Returns 0 if unknown.
         """
         if self.paper is not None or not symbol:
             return 0.0
@@ -1200,15 +1208,18 @@ class DhanBroker:
         if not self.dhan:
             return 0.0
 
+        want_side = str(side or "").upper()
+        if want_side not in ("BUY", "SELL"):
+            return 0.0
         want = str(symbol).upper().replace("-EQ", "").strip()
         best_px = 0.0
         best_ts = ""
 
         for row in self._list_trade_book_rows():
-            side = str(
+            row_side = str(
                 row.get("transactionType") or row.get("transaction_type") or ""
             ).upper()
-            if side != "SELL":
+            if row_side != want_side:
                 continue
             if self._symbol_from_order_row(row) != want:
                 continue
@@ -1224,10 +1235,10 @@ class DhanBroker:
             return best_px
 
         for row in self._list_order_rows():
-            side = str(
+            row_side = str(
                 row.get("transactionType") or row.get("transaction_type") or ""
             ).upper()
-            if side != "SELL":
+            if row_side != want_side:
                 continue
             status = str(
                 row.get("orderStatus") or row.get("order_status") or row.get("status") or ""
@@ -1236,7 +1247,6 @@ class DhanBroker:
                 continue
             if self._symbol_from_order_row(row) != want:
                 continue
-            # Some payloads omit filledQty but still carry averageTradedPrice.
             px = self._row_fill_price(row)
             if px <= 0:
                 continue
@@ -1265,6 +1275,34 @@ class DhanBroker:
                 return hist
         except Exception as e:
             logger.debug(f"{symbol}: sell-history fill lookup failed: {e}")
+        try:
+            quote = self.get_latest_quote(symbol)
+            if quote and quote.get("ltp"):
+                ltp = float(quote["ltp"])
+                if ltp > 0:
+                    return ltp
+        except Exception:
+            pass
+        return float(fallback or 0)
+
+    def resolve_entry_fill_price(
+        self,
+        symbol: str,
+        order_id: str | None = None,
+        *,
+        fallback: float = 0.0,
+    ) -> float:
+        """Prefer broker BUY fill (order id → today's BUY history), then LTP, then fallback."""
+        if order_id:
+            fill = self.get_order_fill_price(order_id)
+            if fill > 0:
+                return fill
+        try:
+            hist = float(self.latest_buy_fill_price(symbol) or 0)
+            if hist > 0:
+                return hist
+        except Exception as e:
+            logger.debug(f"{symbol}: buy-history fill lookup failed: {e}")
         try:
             quote = self.get_latest_quote(symbol)
             if quote and quote.get("ltp"):
@@ -1515,7 +1553,7 @@ class DhanBroker:
             if self.paper.cash < margin_req:
                 logger.warning(f"[PAPER BUY] Blocked {symbol}: Margin required (Rs{margin_req:,.2f}) > Available cash (Rs{self.paper.cash:,.2f})")
                 return None
-            return self.paper.buy(
+            oid = self.paper.buy(
                 symbol,
                 qty,
                 fill,
@@ -1523,6 +1561,8 @@ class DhanBroker:
                 take_profit=take_profit_price,
                 atr=atr,
             )
+            self.last_fill_price = float(fill) if fill and float(fill) > 0 else float(limit_price)
+            return oid
 
         self.ensure_session()
         if not self.dhan:
@@ -1556,9 +1596,13 @@ class DhanBroker:
                         order_flag="SINGLE",
                         product_type=p_type,
                     )
+                fill = self.resolve_entry_fill_price(
+                    symbol, oid, fallback=float(limit_price)
+                )
+                self.last_fill_price = fill
                 logger.warning(
                     f"LIVE SUPER BUY (Dhan) | {symbol} | Qty={qty} | "
-                    f"Order ID={oid} | Status={status}"
+                    f"Order ID={oid} | Status={status} | Fill={fill:.2f}"
                 )
                 return oid
 
@@ -1590,9 +1634,13 @@ class DhanBroker:
                 )
                 return None
 
+            fill = self.resolve_entry_fill_price(
+                symbol, order_id, fallback=float(limit_price)
+            )
+            self.last_fill_price = fill
             logger.warning(
                 f"LIVE BUY ORDER (Dhan) | {symbol} | Product={p_type} ({dhan_ptype}) | Qty={qty} | "
-                f"Limit={entry_price:.2f} | Order ID={order_id} | Status={status}"
+                f"Limit={entry_price:.2f} | Fill={fill:.2f} | Order ID={order_id} | Status={status}"
             )
             if place_stoploss and stop_loss_price:
                 if p_type == "CNC":

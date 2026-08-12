@@ -205,19 +205,41 @@ def _india_try_buy(
             order_guards.block_buy_after_reject(symbol, err[:160])
         return False
 
-    risk_mgr.register_trade(symbol, limit_price, sl, atr)
+    # Prefer Dhan BUY fill for journal/risk; fall back to limit only if unknown.
+    entry_px = float(getattr(india_broker, "last_fill_price", 0) or 0)
+    if entry_px <= 0 and hasattr(india_broker, "resolve_entry_fill_price"):
+        try:
+            entry_px = float(
+                india_broker.resolve_entry_fill_price(
+                    symbol, order_id, fallback=limit_price
+                )
+                or 0
+            )
+        except Exception:
+            entry_px = 0.0
+    if entry_px <= 0:
+        entry_px = float(limit_price)
+
+    # ORB (and wrappers): lock day-fire only after confirmed order acceptance/fill.
+    if hasattr(strategy, "mark_day_fired"):
+        try:
+            strategy.mark_day_fired(symbol, "BUY")
+        except Exception as me:
+            logger.debug(f"{symbol}: mark_day_fired skipped: {me}")
+
+    risk_mgr.register_trade(symbol, entry_px, sl, atr)
     trade_journal.record_entry(
         "INDIA",
         symbol,
         qty,
-        limit_price,
+        entry_px,
         stop_price=sl,
         take_profit=tp,
         reason=reason,
         strategy=strategy.name,
-        meta={"atr": atr, "order_id": order_id},
+        meta={"atr": atr, "order_id": order_id, "limit_price": limit_price},
     )
-    alerts.trade_alert("INDIA", "BUY", symbol, f"qty={qty} @{limit_price}")
+    alerts.trade_alert("INDIA", "BUY", symbol, f"qty={qty} @{entry_px}")
     current_positions[symbol] = {"qty": qty}
     return True
 

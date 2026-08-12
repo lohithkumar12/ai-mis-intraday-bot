@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -472,11 +473,40 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         self.allow_short = bool(getattr(config, "ORB_ALLOW_SHORT", False))
         self.use_htf = bool(getattr(config, "ORB_USE_HTF_FILTER", True))
         self.htf_ema = int(getattr(config, "ORB_HTF_EMA_PERIOD", 20) or 20)
+        # Day-key → side only after a confirmed broker fill (not on bare signal).
         self._fired: dict[str, str] = {}
         logger.info(
             f"[{params.market}] ORB | or={self.or_minutes}m confirm={config.CONFIRM_BARS} "
             f"vol_mult={self.volume_mult} htf_ema={self.htf_ema if self.use_htf else 'off'}"
         )
+
+    def _fire_key(self, symbol: str, day=None) -> str:
+        if day is None:
+            try:
+                from zoneinfo import ZoneInfo
+
+                day = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+            except Exception:
+                day = datetime.now(timezone.utc).date()
+        return f"{str(symbol).upper()}:{day}"
+
+    def mark_day_fired(self, symbol: str, side: str = "BUY", day=None) -> None:
+        """Lock ORB side for the session day after a confirmed fill (not on signal)."""
+        side_u = str(side or "BUY").upper()
+        if side_u not in ("BUY", "SELL"):
+            return
+        key = self._fire_key(symbol, day=day)
+        self._fired[key] = side_u
+        logger.info(f"[ORB] marked fired {key}={side_u} (after confirmed fill)")
+
+    def has_day_fired(self, symbol: str, side: str | None = None, day=None) -> bool:
+        key = self._fire_key(symbol, day=day)
+        got = self._fired.get(key)
+        if not got:
+            return False
+        if side is None:
+            return True
+        return got == str(side).upper()
 
     def _session_date(self, ts) -> object:
         try:
@@ -572,10 +602,11 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         long_ok = bool((confirm["close"] > or_high).all())
         short_ok = bool((confirm["close"] < or_low).all())
 
+        # Do NOT mark _fired here — only after confirmed fill via mark_day_fired().
+        # Failed/rejected buys must be allowed to retry while the breakout holds.
         if long_ok and self._fired.get(key) != "BUY":
             if bias == "SELL":
                 return "HOLD"
-            self._fired[key] = "BUY"
             logger.info(
                 f"[BUY SIGNAL] {symbol} — ORB long break ORH={or_high:.2f} "
                 f"confirm={confirm_n} vol_ok"
@@ -585,7 +616,6 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         if self.allow_short and short_ok and self._fired.get(key) != "SELL":
             if bias == "BUY":
                 return "HOLD"
-            self._fired[key] = "SELL"
             logger.info(
                 f"[SELL SIGNAL] {symbol} — ORB short break ORL={or_low:.2f}"
             )
@@ -695,6 +725,17 @@ class FilteredStrategy(BaseStrategy):
             return "HOLD"
         return signal
 
+    def mark_day_fired(self, symbol: str, side: str = "BUY", day=None) -> None:
+        inner = getattr(self, "inner", None)
+        if inner is not None and hasattr(inner, "mark_day_fired"):
+            inner.mark_day_fired(symbol, side=side, day=day)
+
+    def has_day_fired(self, symbol: str, side: str | None = None, day=None) -> bool:
+        inner = getattr(self, "inner", None)
+        if inner is not None and hasattr(inner, "has_day_fired"):
+            return bool(inner.has_day_fired(symbol, side=side, day=day))
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Factory
@@ -758,3 +799,12 @@ class Strategy(TrendPullbackStrategy):
 
     def latest_atr(self, df: pd.DataFrame) -> Optional[float]:
         return self._delegate.latest_atr(df)
+
+    def mark_day_fired(self, symbol: str, side: str = "BUY", day=None) -> None:
+        if hasattr(self._delegate, "mark_day_fired"):
+            self._delegate.mark_day_fired(symbol, side=side, day=day)
+
+    def has_day_fired(self, symbol: str, side: str | None = None, day=None) -> bool:
+        if hasattr(self._delegate, "has_day_fired"):
+            return bool(self._delegate.has_day_fired(symbol, side=side, day=day))
+        return False
