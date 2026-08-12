@@ -118,6 +118,14 @@ def _refresh_rs_filter(rs_filter, symbol_dfs: dict):
         rs_filter.update_scores(symbol_dfs)
 
 
+def _india_mis_day_pl(india_broker, equity: float) -> float:
+    """Journal-style day P&L for MIS kill-switch (not raw Dhan equity delta)."""
+    from dashboard_server import _broker_style_day_pl
+
+    day_pl, _, _ = _broker_style_day_pl("INDIA", india_broker, float(equity or 0))
+    return float(day_pl)
+
+
 def _india_try_buy(
     *,
     india_broker,
@@ -475,7 +483,10 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
 
             trade_journal.snapshot_equity("INDIA", current_equity)
 
-            if risk_mgr.check_daily_drawdown(current_equity, start_of_day_equity):
+            mis_day_pl = _india_mis_day_pl(india_broker, current_equity)
+            if risk_mgr.check_daily_drawdown(
+                current_equity, start_of_day_equity, day_pl=mis_day_pl
+            ):
                 logger.critical("[INDIA KILL-SWITCH] Trading PAUSED (daily drawdown).")
                 alerts.kill_switch_alert("INDIA", True)
                 india_broker.cancel_all_open_orders()
@@ -488,11 +499,13 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                         sq = india_broker.square_off_intraday_positions()
                         if sq:
                             logger.warning(f"[INDIA KILL FLATTEN] Closed: {sq}")
+                bot_state.mark_healthy("INDIA")
                 time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
                 continue
 
             if risk_mgr.is_kill_switch_active:
                 logger.critical("[INDIA KILL-SWITCH] Active — skipping entries.")
+                bot_state.mark_healthy("INDIA")
                 time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
                 continue
 
@@ -653,12 +666,16 @@ def run_india_scout_loop(strategy, risk_mgr, rs_filter=None):
             else:
                 bot_state.india_sod_equity(sod)
 
-            if risk_mgr.check_daily_drawdown(current_equity, sod):
+            if risk_mgr.check_daily_drawdown(
+                current_equity, sod, day_pl=_india_mis_day_pl(india_broker, current_equity)
+            ):
                 logger.critical("[INDIA SCOUT] Kill-switch (daily drawdown) — no entries")
+                bot_state.mark_healthy("INDIA_SCOUT")
                 time.sleep(interval)
                 continue
             if risk_mgr.is_kill_switch_active:
                 logger.critical("[INDIA SCOUT] Kill-switch active — skipping entries")
+                bot_state.mark_healthy("INDIA_SCOUT")
                 time.sleep(interval)
                 continue
 

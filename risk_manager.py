@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Optional
 
 import config
+import bot_state
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +50,6 @@ class RiskManager:
         self.daily_drawdown_limit = config.DAILY_DRAWDOWN_LIMIT
         self.max_open_positions = config.MAX_OPEN_POSITIONS
         self.max_cluster_positions = config.MAX_CLUSTER_POSITIONS
-
-        self._kill_switch_active: bool = False
-        self._kill_switch_day = None  # date when kill switch tripped
 
         # Track high-water marks for trailing stops: symbol -> peak price since entry
         self._trail_peaks: dict[str, float] = {}
@@ -389,31 +387,65 @@ class RiskManager:
     # Daily Drawdown Kill-Switch
     # -----------------------------------------------------------------------
     def check_daily_drawdown(
-        self, current_equity: float, start_of_day_equity: float
+        self,
+        current_equity: float,
+        start_of_day_equity: float,
+        *,
+        day_pl: float | None = None,
     ) -> bool:
-        if start_of_day_equity <= 0:
-            logger.error(
-                "Start-of-day equity invalid — halting for safety."
-            )
-            return True
+        """
+        Returns True when daily loss exceeds DAILY_DRAWDOWN_LIMIT (kill-switch ON).
 
-        if self.market == "INDIA" and self.capital_cap() > 0:
-            drawdown = self.drawdown_vs_cap(current_equity, start_of_day_equity)
-            base = self.effective_equity(start_of_day_equity)
-            dd_note = f"vs sleeve base={base:,.0f}"
+        India MIS (INDIA_CAPITAL_CAP > 0): uses journal-style day_pl when provided
+        so CNC holdings / margin equity swings do not false-trip the switch.
+        """
+        cap = self.capital_cap()
+        use_mis_day_pl = (
+            self.market == "INDIA" and cap > 0 and day_pl is not None
+        )
+
+        if use_mis_day_pl:
+            loss = max(0.0, -float(day_pl))
+            base = cap
+            drawdown = (loss / base) if base > 0 else 0.0
+            dd_note = (
+                f"MIS day P&L ₹{float(day_pl):+,.2f} vs sleeve ₹{base:,.0f}"
+            )
         else:
-            drawdown = (start_of_day_equity - current_equity) / start_of_day_equity
-            dd_note = "vs full SOD"
+            if start_of_day_equity <= 0:
+                logger.error(
+                    "Start-of-day equity invalid — halting for safety."
+                )
+                bot_state.activate_kill_switch(self.market, "invalid_sod")
+                return True
+
+            if self.market == "INDIA" and cap > 0:
+                drawdown = self.drawdown_vs_cap(current_equity, start_of_day_equity)
+                base = self.effective_equity(start_of_day_equity)
+                dd_note = f"vs sleeve base={base:,.0f}"
+            else:
+                drawdown = (start_of_day_equity - current_equity) / start_of_day_equity
+                dd_note = "vs full SOD"
 
         if drawdown >= self.daily_drawdown_limit:
-            self._kill_switch_active = True
-            self._kill_switch_day = datetime.now().date()
+            reason = f"daily_drawdown {drawdown:.2%}"
+            bot_state.activate_kill_switch(self.market, reason)
             logger.critical(
                 f"DAILY DRAWDOWN KILL-SWITCH TRIGGERED! "
                 f"Drawdown={drawdown:.2%} (Limit={self.daily_drawdown_limit:.0%}) "
-                f"{dd_note} | SOD={start_of_day_equity:,.2f} → Current={current_equity:,.2f}"
+                f"{dd_note}"
             )
             return True
+
+        prev_reason = bot_state.kill_switch_reason(self.market)
+        if bot_state.is_kill_switch_active(self.market) and (
+            prev_reason.startswith("daily_drawdown") or prev_reason == "invalid_sod"
+        ):
+            bot_state.reset_kill_switch(self.market)
+            logger.warning(
+                f"[{self.market}] Kill switch cleared — drawdown {drawdown:.2%} "
+                f"within limit ({dd_note})"
+            )
 
         logger.info(
             f"Daily drawdown: {drawdown:.2%} "
@@ -423,17 +455,15 @@ class RiskManager:
 
     @property
     def is_kill_switch_active(self) -> bool:
-        return bool(self._kill_switch_active)
+        return bot_state.is_kill_switch_active(self.market)
 
     def activate_kill_switch(self, reason: str = "manual"):
-        self._kill_switch_active = True
-        self._kill_switch_day = datetime.now().date()
+        bot_state.activate_kill_switch(self.market, reason)
         logger.critical(f"[{self.market}] Kill switch ACTIVATED ({reason})")
 
     def reset_kill_switch(self):
         """Reset only for a new trading day (caller should gate by date)."""
-        self._kill_switch_active = False
-        self._kill_switch_day = None
+        bot_state.reset_kill_switch(self.market)
         logger.info(
             f"[{self.market}] Daily drawdown kill-switch reset for new trading day."
         )

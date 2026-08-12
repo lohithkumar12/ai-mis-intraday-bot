@@ -27,6 +27,8 @@ _health: dict[str, Any] = {
 }
 _india_sod: dict[str, Any] = {"date": None, "equity": None}
 _us_sod: dict[str, Any] = {"date": None, "equity": None}
+# Shared kill-switch (loop + dashboard must use the same flag)
+_kill: dict[str, dict[str, Any]] = {}
 
 
 def publish_signals(market: str, items: list[dict]) -> None:
@@ -135,6 +137,41 @@ def reset_sod_for_tests() -> None:
         _india_sod["equity"] = None
         _us_sod["date"] = None
         _us_sod["equity"] = None
+
+
+def reset_kill_for_tests() -> None:
+    with _lock:
+        _kill.clear()
+
+
+def is_kill_switch_active(market: str) -> bool:
+    key = str(market or "").upper()
+    with _lock:
+        row = _kill.get(key) or {}
+        return bool(row.get("active"))
+
+
+def kill_switch_reason(market: str) -> str:
+    key = str(market or "").upper()
+    with _lock:
+        row = _kill.get(key) or {}
+        return str(row.get("reason") or "")
+
+
+def activate_kill_switch(market: str, reason: str = "manual") -> None:
+    key = str(market or "").upper()
+    with _lock:
+        _kill[key] = {
+            "active": True,
+            "reason": str(reason or "manual")[:200],
+            "day": date.today().isoformat(),
+        }
+
+
+def reset_kill_switch(market: str) -> None:
+    key = str(market or "").upper()
+    with _lock:
+        _kill[key] = {"active": False, "reason": "", "day": None}
 
 
 def _rebaseline_sod_if_needed(

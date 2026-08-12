@@ -35,7 +35,7 @@ def _broker_style_day_pl(
 ) -> tuple[float, float, dict]:
     """Today's P&L ≈ Dhan: realized (closed today) + unrealized (open MTM).
 
-    Kill-switch still uses equity vs SOD in main.py — not this display figure.
+    India MIS kill-switch uses this same figure (via day_pl=) — not raw equity vs SOD.
     """
     # Before summing journal realized, rewrite today's exits from Dhan SELL fills
     # when the broker exposes that lookup (fixes stale-LTP / missing-LTP rows).
@@ -248,6 +248,7 @@ def get_india_status():
         "live_armed": config.LIVE_CONFIRMED,
         "strategy": config.STRATEGY_NAME,
         "kill_switch_active": india_risk.is_kill_switch_active,
+        "kill_switch_reason": bot_state.kill_switch_reason("INDIA"),
         "equity_history": _india_equity_history,
         "performance": trade_journal.performance_stats("INDIA"),
         "open_risk_pct": round(
@@ -664,7 +665,8 @@ def toggle_india_kill_switch():
         alerts.kill_switch_alert("INDIA", True)
         state = "activated"
 
-    return jsonify({"status": "success", "message": f"India kill switch {state}"})
+    return jsonify({"status": "success", "message": f"India kill switch {state}",
+                    "kill_switch_active": india_risk.is_kill_switch_active})
 
 
 # ===========================================================================
