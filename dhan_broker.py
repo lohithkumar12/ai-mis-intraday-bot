@@ -510,11 +510,16 @@ class DhanBroker:
                 continue
             qty = abs(float(pos.get("qty") or 0))
             buy = float(pos.get("avg_entry_price") or 0)
+            side = str(pos.get("side") or "BUY").upper()
             pos["current_price"] = quote_ltp
             pos["market_value"] = qty * quote_ltp
             if buy > 0 and qty > 0:
-                pos["unrealized_pl"] = (quote_ltp - buy) * qty
-                pos["unrealized_plpc"] = (quote_ltp - buy) / buy
+                if side == "SELL":
+                    pos["unrealized_pl"] = (buy - quote_ltp) * qty
+                    pos["unrealized_plpc"] = (buy - quote_ltp) / buy
+                else:
+                    pos["unrealized_pl"] = (quote_ltp - buy) * qty
+                    pos["unrealized_plpc"] = (quote_ltp - buy) / buy
             src = (quote or {}).get("source") or "quote"
             pos["ltp_source"] = src
             logger.info(
