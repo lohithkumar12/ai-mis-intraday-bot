@@ -15,7 +15,7 @@ import json
 from datetime import datetime, timezone
 import threading
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 from flask_cors import CORS
 
 import config
@@ -166,6 +166,260 @@ def get_us_risk():
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+# ===========================================================================
+# SSE Live Stream — Real-time position/status push via WebSocket quote cache
+# ===========================================================================
+_sse_pos_cache: dict[str, tuple[float, dict]] = {}  # market -> (timestamp, positions_base)
+_SSE_POS_REFRESH_SEC = 30.0  # full broker API call interval for base position data
+
+
+def _get_live_feed_for_market(market: str):
+    """Return the appropriate live feed manager for the market."""
+    if market == "US":
+        try:
+            from dhan_us_live_feed import get_us_live_feed_manager
+            return get_us_live_feed_manager()
+        except Exception:
+            return None
+    else:
+        try:
+            from dhan_live_feed import get_live_feed_manager
+            return get_live_feed_manager()
+        except Exception:
+            return None
+
+
+def _fetch_positions_base(market: str) -> tuple[list, dict | None]:
+    """Fetch full position data from broker (heavy API call). Returns (positions_list, account_info)."""
+    if market == "US":
+        broker, _ = get_us_components()
+        risk_mgr = get_us_risk()
+    else:
+        broker, _ = get_india_components()
+        risk_mgr = get_india_risk()
+
+    if not broker or not broker.is_logged_in:
+        return [], None
+
+    positions_dict = broker.get_open_positions() or {}
+    positions_list = []
+
+    for symbol, pos in positions_dict.items():
+        entry_price = pos["avg_entry_price"]
+        side = str(pos.get("side") or "BUY").upper()
+        atr = pos.get("atr")
+        sl_price = pos.get("stop_loss")
+        tp_price = pos.get("take_profit")
+
+        if sl_price is None:
+            if market == "INDIA" and side == "SELL":
+                if atr is not None:
+                    try:
+                        sl_price = float(entry_price) + (
+                            float(risk_mgr.atr_stop_mult) * float(atr)
+                        )
+                    except Exception:
+                        sl_price = float(entry_price) * (1 + float(risk_mgr.stop_loss_pct))
+                else:
+                    sl_price = float(entry_price) * (1 + float(risk_mgr.stop_loss_pct))
+            else:
+                sl_price = risk_mgr.get_stop_loss_price(entry_price, atr)
+
+        if tp_price is None:
+            if market == "INDIA" and side == "SELL":
+                risk = max(float(sl_price) - float(entry_price), 0.0)
+                if risk > 0:
+                    tp_price = float(entry_price) - (float(risk_mgr.take_profit_r) * risk)
+                else:
+                    tp_price = float(entry_price) * (1 - float(risk_mgr.take_profit_pct))
+            else:
+                tp_price = risk_mgr.get_take_profit_price(
+                    entry_price, stop_loss_price=sl_price, atr=atr
+                )
+
+        positions_list.append({
+            "symbol": symbol,
+            "qty": pos["qty"],
+            "side": side,
+            "avg_entry_price": entry_price,
+            "current_price": pos["current_price"],
+            "market_value": pos["market_value"],
+            "unrealized_pl": pos["unrealized_pl"],
+            "unrealized_plpc": round(pos["unrealized_plpc"] * 100, 2),
+            "stop_loss": sl_price,
+            "take_profit": tp_price,
+        })
+
+    account_info = broker.get_account_info()
+    return positions_list, account_info
+
+
+def _apply_live_quotes(positions: list, feed) -> list:
+    """Overlay live WebSocket LTP onto position data for instant price updates."""
+    if not feed or not positions:
+        return positions
+
+    updated = []
+    for pos in positions:
+        pos = dict(pos)  # shallow copy
+        quote = feed.get_live_quote(pos["symbol"])
+        if quote and quote.get("ltp") and float(quote["ltp"]) > 0:
+            ltp = float(quote["ltp"])
+            entry = float(pos["avg_entry_price"] or 0)
+            qty = abs(int(pos["qty"] or 0))
+            side = str(pos.get("side") or "BUY").upper()
+
+            pos["current_price"] = ltp
+            pos["market_value"] = qty * ltp
+            if entry > 0 and qty > 0:
+                if side == "SELL":
+                    pos["unrealized_pl"] = (entry - ltp) * qty
+                    pos["unrealized_plpc"] = round(((entry - ltp) / entry) * 100, 2)
+                else:
+                    pos["unrealized_pl"] = (ltp - entry) * qty
+                    pos["unrealized_plpc"] = round(((ltp - entry) / entry) * 100, 2)
+        updated.append(pos)
+    return updated
+
+
+def _build_status_payload(market: str, broker, account_info: dict | None) -> dict | None:
+    """Build a status payload similar to /api/status but lightweight for SSE."""
+    if not account_info:
+        return None
+
+    equity = account_info["equity"]
+    cash = account_info["available_cash"]
+
+    if market == "US":
+        risk_mgr = get_us_risk()
+        last_eq = float(bot_state.us_sod_equity(equity))
+        market_open = broker.is_market_open() if broker else False
+    else:
+        risk_mgr = get_india_risk()
+        last_eq = float(bot_state.india_sod_equity(equity))
+        try:
+            from zoneinfo import ZoneInfo
+            IST = ZoneInfo("Asia/Kolkata")
+        except ImportError:
+            import pytz
+            IST = pytz.timezone("Asia/Kolkata")
+        now_ist = datetime.now(IST)
+        is_weekday = now_ist.weekday() < 5
+        mkt_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+        mkt_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+        market_open = is_weekday and mkt_open <= now_ist <= mkt_close
+
+    daily_pl, daily_pl_pct, day_pl_detail = _broker_style_day_pl(
+        market, broker, equity
+    )
+
+    return {
+        "status": "success",
+        "market": market,
+        "currency": "USD" if market == "US" else "INR",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "equity": equity,
+        "last_equity": last_eq,
+        "daily_pl": round(daily_pl, 2),
+        "daily_pl_pct": round(daily_pl_pct, 2),
+        "available_cash": cash,
+        "used_margin": account_info.get("used_margin", 0),
+        "market_open": market_open,
+        "logged_in": broker.is_logged_in if broker else False,
+        "broker": "dhan_global" if market == "US" else config.INDIA_BROKER,
+        "paper_trading": config.US_PAPER if market == "US" else config.INDIA_PAPER,
+        "live_armed": config.US_LIVE_CONFIRMED if market == "US" else config.LIVE_CONFIRMED,
+        "kill_switch_active": risk_mgr.is_kill_switch_active if risk_mgr else False,
+    }
+
+
+def _sse_generator(market: str):
+    """Generator that yields SSE events with live position + status data."""
+    global _sse_pos_cache
+
+    tick = 0
+    last_pos_refresh = 0.0
+    positions_base = []
+    account_info = None
+    broker = None
+
+    while True:
+        try:
+            now = time.time()
+
+            # Refresh base position data from broker every _SSE_POS_REFRESH_SEC
+            if now - last_pos_refresh > _SSE_POS_REFRESH_SEC:
+                try:
+                    positions_base, account_info = _fetch_positions_base(market)
+                    if market == "US":
+                        broker, _ = get_us_components()
+                    else:
+                        broker, _ = get_india_components()
+                    last_pos_refresh = now
+                except Exception as e:
+                    logger.debug(f"SSE position refresh error ({market}): {e}")
+
+            # Get live feed and overlay LTP from WebSocket cache
+            feed = _get_live_feed_for_market(market)
+            live_positions = _apply_live_quotes(positions_base, feed)
+
+            # Every tick (~1s): push positions with live prices
+            pos_payload = json.dumps(live_positions, default=str)
+            yield f"event: positions\ndata: {pos_payload}\n\n"
+
+            # Every 3 ticks (~3s): push status with P&L
+            if tick % 3 == 0:
+                try:
+                    status = _build_status_payload(market, broker, account_info)
+                    if status:
+                        # Add live feed connection info
+                        feed_connected = feed.is_connected() if feed else False
+                        status["live_feed_connected"] = feed_connected
+                        status_payload = json.dumps(status, default=str)
+                        yield f"event: status\ndata: {status_payload}\n\n"
+                except Exception as e:
+                    logger.debug(f"SSE status build error: {e}")
+
+            # Every 15 ticks (~15s): heartbeat
+            if tick % 15 == 0:
+                hb = json.dumps({
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "feed_connected": feed.is_connected() if feed else False,
+                    "symbols_cached": len(feed._quote_cache) if feed else 0,
+                })
+                yield f"event: heartbeat\ndata: {hb}\n\n"
+
+            tick += 1
+            time.sleep(1.0)
+
+        except GeneratorExit:
+            logger.debug(f"SSE client disconnected ({market})")
+            return
+        except Exception as e:
+            logger.warning(f"SSE generator error ({market}): {e}")
+            err = json.dumps({"error": str(e)})
+            yield f"event: error\ndata: {err}\n\n"
+            time.sleep(3.0)
+
+
+@app.route("/api/live-stream")
+def live_stream():
+    """Server-Sent Events endpoint for real-time position/status updates."""
+    market = request.args.get("market", "INDIA").upper()
+    if market not in ("INDIA", "US"):
+        market = "INDIA"
+
+    return Response(
+        _sse_generator(market),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ===========================================================================

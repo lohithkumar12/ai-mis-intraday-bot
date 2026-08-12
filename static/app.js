@@ -8,14 +8,19 @@ let scannerGeneration = 0;
 let liveAbort = null;
 let scannerAbort = null;
 
+// SSE (Server-Sent Events) state
+let sseSource = null;          // EventSource instance
+let sseConnected = false;      // true when SSE is actively streaming
+let livePollingTimer = null;   // fallback polling timer ID
+
 document.addEventListener("DOMContentLoaded", () => {
-    fetchLiveData();
+    // Try SSE first for real-time positions/status; fall back to polling
+    connectLiveStream();
     fetchScannerData();
     fetchScoutData();
     fetchLogs();
     fetchTrades();
     fetchHealth();
-    setInterval(fetchLiveData, 3000);
     setInterval(fetchScannerData, 60000);
     setInterval(fetchScoutData, 60000);
     setInterval(fetchLogs, 5000);
@@ -49,6 +54,119 @@ function currentFormatter() {
     return activeMarket === "US" ? formatUSD : formatINR;
 }
 
+/* ---------- SSE Live Stream ---------- */
+
+function connectLiveStream() {
+    // Close existing connection
+    if (sseSource) {
+        sseSource.close();
+        sseSource = null;
+    }
+    sseConnected = false;
+    updateLiveIndicator(false);
+
+    // Start polling as immediate fallback (will be stopped once SSE connects)
+    startLivePolling();
+
+    // Also do an immediate REST fetch so we don't wait for SSE to connect
+    fetchLiveData();
+
+    try {
+        const url = `/api/live-stream?market=${activeMarket}`;
+        sseSource = new EventSource(url);
+
+        sseSource.addEventListener("positions", (e) => {
+            try {
+                const positions = JSON.parse(e.data);
+                const fmt = currentFormatter();
+                updatePositionsUI(positions, fmt, 'closePosition');
+                if (!sseConnected) {
+                    sseConnected = true;
+                    stopLivePolling();
+                    updateLiveIndicator(true);
+                }
+            } catch (err) {
+                console.error("SSE positions parse error:", err);
+            }
+        });
+
+        sseSource.addEventListener("status", (e) => {
+            try {
+                const status = JSON.parse(e.data);
+                if (status.status === "disabled" || status.status === "error") {
+                    renderDisabledState(status.message);
+                } else {
+                    updateStatusUI(status);
+                }
+            } catch (err) {
+                console.error("SSE status parse error:", err);
+            }
+        });
+
+        sseSource.addEventListener("heartbeat", (e) => {
+            try {
+                const hb = JSON.parse(e.data);
+                const indicator = document.getElementById("live-indicator");
+                if (indicator) {
+                    const feedOk = hb.feed_connected;
+                    indicator.title = feedOk
+                        ? `WS Live · ${hb.symbols_cached} symbols · ${hb.time}`
+                        : `SSE active (REST quotes) · ${hb.time}`;
+                }
+            } catch (err) { /* ignore */ }
+        });
+
+        sseSource.addEventListener("error", (e) => {
+            try {
+                const errData = JSON.parse(e.data);
+                console.warn("SSE server error:", errData.error);
+            } catch (_) { /* ignore */ }
+        });
+
+        sseSource.onerror = () => {
+            console.warn("SSE connection lost — falling back to polling");
+            sseConnected = false;
+            updateLiveIndicator(false);
+            startLivePolling();
+            // EventSource auto-reconnects; when it does, stopLivePolling kicks in
+        };
+
+        sseSource.onopen = () => {
+            console.log("SSE connected to /api/live-stream");
+        };
+
+    } catch (err) {
+        console.error("EventSource not supported or failed:", err);
+        startLivePolling();
+    }
+}
+
+function startLivePolling() {
+    if (livePollingTimer) return; // already polling
+    livePollingTimer = setInterval(fetchLiveData, 3000);
+}
+
+function stopLivePolling() {
+    if (livePollingTimer) {
+        clearInterval(livePollingTimer);
+        livePollingTimer = null;
+    }
+}
+
+function updateLiveIndicator(streaming) {
+    const el = document.getElementById("live-indicator");
+    if (!el) return;
+    if (streaming) {
+        el.innerHTML = '<i class="fa-solid fa-bolt"></i> LIVE';
+        el.className = "live-indicator live-indicator-active";
+        el.title = "Real-time streaming via WebSocket → SSE";
+    } else {
+        el.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i> Polling';
+        el.className = "live-indicator live-indicator-polling";
+        el.title = "Polling every 3 seconds (SSE not connected)";
+    }
+}
+
 function switchMarket(market) {
     if (activeMarket === market) return;
     activeMarket = market;
@@ -77,7 +195,9 @@ function switchMarket(market) {
     }
 
     clearMarketPanels();
-    fetchCurrentTabData();
+    // Reconnect SSE for new market
+    connectLiveStream();
+    fetchScannerData();
     fetchTrades();
 }
 
