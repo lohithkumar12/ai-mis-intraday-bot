@@ -1,4 +1,4 @@
-"""Today's P&L KPI = open unrealized only (Dhan-style; journal realized is debug-only)."""
+"""Today's P&L KPI = realized (closed today) + unrealized (open MTM)."""
 
 from __future__ import annotations
 
@@ -30,8 +30,7 @@ class TestBrokerStyleDayPl(unittest.TestCase):
         self.assertAlmostEqual(detail["unrealized"], 14.0)
         self.assertAlmostEqual(day_pct, 14.0 / (2 * 8280.0) * 100)
 
-    def test_kpi_ignores_journal_realized(self):
-        """Poisoned journal closes must not drag Today's P&L away from Dhan MTM."""
+    def test_kpi_includes_journal_realized(self):
         broker = MagicMock()
         broker.get_open_positions.return_value = {
             "DIVISLAB": {
@@ -42,9 +41,19 @@ class TestBrokerStyleDayPl(unittest.TestCase):
         }
         with patch.object(trade_journal, "realized_pnl_today", return_value=-23.5):
             day_pl, _, detail = _broker_style_day_pl("INDIA", broker, 100_000.0)
-        self.assertAlmostEqual(day_pl, 11.0)
+        self.assertAlmostEqual(day_pl, 11.0 - 23.5)
         self.assertAlmostEqual(detail["unrealized"], 11.0)
         self.assertAlmostEqual(detail["realized"], -23.5)
+
+    def test_flat_book_shows_realized_only(self):
+        broker = MagicMock()
+        broker.get_open_positions.return_value = {}
+        with patch.object(trade_journal, "realized_pnl_today", return_value=-84.8):
+            day_pl, day_pct, detail = _broker_style_day_pl("INDIA", broker, 229_000.0)
+        self.assertAlmostEqual(day_pl, -84.8)
+        self.assertAlmostEqual(detail["realized"], -84.8)
+        self.assertAlmostEqual(detail["unrealized"], 0.0)
+        self.assertAlmostEqual(day_pct, -84.8 / 229_000.0 * 100)
 
     def test_falls_back_to_unrealized_pl_when_ltp_missing(self):
         broker = MagicMock()
@@ -90,6 +99,21 @@ class TestRealizedPnlToday(unittest.TestCase):
 
         total = trade_journal.realized_pnl_today("INDIA", tz_name="Asia/Kolkata")
         self.assertAlmostEqual(total, 10.0)
+
+    def test_reconcile_broker_flats(self):
+        trade_journal.record_entry("INDIA", "SBIN", 22, 1082.0)
+        trade_journal.record_entry("INDIA", "INFY", 20, 1189.0)
+        closed = trade_journal.reconcile_broker_flats(
+            "INDIA",
+            {"INFY"},
+            price_lookup=lambda s: 1081.0 if s == "SBIN" else 0.0,
+            reason="broker_flat",
+        )
+        self.assertEqual(closed, ["SBIN"])
+        open_rows = trade_journal.list_open_trades("INDIA")
+        self.assertEqual([r["symbol"] for r in open_rows], ["INFY"])
+        realized = trade_journal.realized_pnl_today("INDIA", tz_name="Asia/Kolkata")
+        self.assertAlmostEqual(realized, (1081.0 - 1082.0) * 22)
 
 
 if __name__ == "__main__":

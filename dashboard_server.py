@@ -33,10 +33,8 @@ CORS(app)
 def _broker_style_day_pl(
     market: str, broker, equity: float
 ) -> tuple[float, float, dict]:
-    """Today's P&L like Dhan: open unrealized only (prefer (ltp − avg) × qty).
+    """Today's P&L ≈ Dhan: realized (closed today) + unrealized (open MTM).
 
-    Journal realized is exposed in day_pl_detail for debug but not added to the
-    KPI — SQLite closes can diverge from broker fills (false SL / bad exits).
     Kill-switch still uses equity vs SOD in main.py — not this display figure.
     """
     positions = {}
@@ -67,8 +65,7 @@ def _broker_style_day_pl(
         logger.debug(f"{market} realized day P&L failed: {e}")
         realized = 0.0
 
-    # Match Dhan: open MTM only. Do not fold journal realized into the KPI.
-    day_pl = unreal
+    day_pl = unreal + realized
     denom = cost if cost > 0 else (float(equity) if equity and equity > 0 else 0.0)
     day_pct = (day_pl / denom * 100.0) if denom else 0.0
     detail = {
@@ -588,9 +585,11 @@ def close_india_position(symbol):
             )
     unreal = float(pos.get("unrealized_pl") or ((exit_px - entry) * qty))
 
-    success = india_broker.close_position(symbol)
-    if not success:
+    fill = india_broker.close_position(symbol)
+    if fill is None:
         return jsonify({"status": "error", "message": f"Failed to close India position for {symbol}"}), 400
+    if float(fill) > 0:
+        exit_px = float(fill)
 
     # Journal the exit so Recent Trades / performance P&L update
     journal_row = trade_journal.record_exit(

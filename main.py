@@ -232,14 +232,45 @@ def _india_try_sell(
     if symbol not in current_positions:
         return False
     pos = current_positions[symbol]
-    px = pos.get("current_price") or pos.get("avg_entry_price")
-    if india_broker.close_position(symbol):
-        trade_journal.record_exit("INDIA", symbol, float(px or 0), reason="signal_sell")
+    fallback = float(pos.get("current_price") or pos.get("avg_entry_price") or 0)
+    fill = india_broker.close_position(symbol)
+    if fill is not None:
+        px = float(fill) if float(fill) > 0 else fallback
+        trade_journal.record_exit("INDIA", symbol, px, reason="signal_sell")
         risk_mgr.clear_trade(symbol)
         alerts.trade_alert("INDIA", "SELL", symbol, f"@{px}")
         current_positions.pop(symbol, None)
         return True
     return False
+
+
+def _reconcile_india_journal(india_broker, risk_mgr, current_positions: dict) -> None:
+    """Close journal rows when Dhan is already flat (broker SL / app close)."""
+    try:
+        def _px(sym: str) -> float:
+            pos = (current_positions or {}).get(sym) or {}
+            mark = float(pos.get("current_price") or pos.get("avg_entry_price") or 0)
+            if mark > 0:
+                return mark
+            q = india_broker.get_latest_quote(sym)
+            if q and q.get("ltp"):
+                return float(q["ltp"])
+            return 0.0
+
+        closed = trade_journal.reconcile_broker_flats(
+            "INDIA",
+            set((current_positions or {}).keys()),
+            price_lookup=_px,
+            reason="broker_flat",
+        )
+        for sym in closed:
+            risk_mgr.clear_trade(sym)
+            if current_positions is not None:
+                current_positions.pop(sym, None)
+        if closed:
+            logger.info(f"[INDIA] Journal reconciled broker flats: {closed}")
+    except Exception as e:
+        logger.debug(f"[INDIA] journal reconcile skipped: {e}")
 
 
 def is_india_market_open() -> bool:
@@ -338,6 +369,13 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
             if closed:
                 logger.info(f"[INDIA] Closed via SL/TP: {closed}")
 
+            # Early positions snapshot for journal/broker sync (also refreshed later)
+            try:
+                early_pos = india_broker.get_open_positions() or {}
+                _reconcile_india_journal(india_broker, risk_mgr, early_pos)
+            except Exception as e:
+                logger.debug(f"[INDIA] early reconcile skipped: {e}")
+
             if config.INDIA_PRODUCT_TYPE.upper() in ("INTRADAY", "INTRA", "MIS"):
                 # Auto square-off from SQUAREOFF_TIME (default 15:10 IST)
                 sq_h, sq_m = risk_mgr.squareoff_hm()
@@ -419,6 +457,7 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
             )
 
             current_positions = india_broker.get_open_positions()
+            _reconcile_india_journal(india_broker, risk_mgr, current_positions or {})
 
             bar_cache: dict = {}
             for symbol in config.INDIA_STOCK_UNIVERSE:
@@ -583,6 +622,7 @@ def run_india_scout_loop(strategy, risk_mgr, rs_filter=None):
                 now_ist, market_open_hm=(9, 15), market_close_hm=(15, 30)
             )
             current_positions = india_broker.get_open_positions() or {}
+            _reconcile_india_journal(india_broker, risk_mgr, current_positions)
 
             bar_cache: dict = {}
             scored: list = []

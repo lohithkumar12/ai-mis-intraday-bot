@@ -1060,6 +1060,62 @@ class DhanBroker:
             logger.warning(f"Order status lookup failed for {order_id}: {e}")
             return "UNKNOWN", str(e)
 
+    def get_order_fill_price(self, order_id: str) -> float:
+        """Average traded / fill price from order book; 0 if unknown."""
+        if self.paper is not None or not order_id:
+            return 0.0
+        self.ensure_session()
+        if not self.dhan:
+            return 0.0
+        try:
+            method = getattr(self.dhan, "get_order_by_id", None)
+            if not callable(method):
+                return 0.0
+            resp = method(str(order_id))
+            row = self._parse_order_payload(resp)
+            for key in (
+                "averageTradedPrice",
+                "avgTradedPrice",
+                "averagePrice",
+                "avgPrice",
+                "tradedPrice",
+                "price",
+            ):
+                raw = row.get(key)
+                if raw is None or raw == "":
+                    continue
+                try:
+                    px = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if px > 0:
+                    return px
+        except Exception as e:
+            logger.debug(f"fill price lookup failed for {order_id}: {e}")
+        return 0.0
+
+    def resolve_exit_fill_price(
+        self,
+        symbol: str,
+        order_id: str | None = None,
+        *,
+        fallback: float = 0.0,
+    ) -> float:
+        """Prefer broker fill, then live LTP, then caller fallback."""
+        if order_id:
+            fill = self.get_order_fill_price(order_id)
+            if fill > 0:
+                return fill
+        try:
+            quote = self.get_latest_quote(symbol)
+            if quote and quote.get("ltp"):
+                ltp = float(quote["ltp"])
+                if ltp > 0:
+                    return ltp
+        except Exception:
+            pass
+        return float(fallback or 0)
+
     def confirm_live_order(
         self,
         order_id: str,
@@ -1537,17 +1593,50 @@ class DhanBroker:
             logger.error(f"Failed to place SELL for {symbol}: {e}", exc_info=True)
             return None
 
-    def close_position(self, symbol: str) -> bool:
+    def close_position(self, symbol: str) -> float | None:
+        """
+        Flatten symbol. Returns exit fill price on success, else None.
+        (Truthy float so existing `if close_position(...)` checks keep working.)
+        """
         positions = self.get_open_positions()
         if symbol not in positions:
             logger.warning(f"{symbol}: No open position to close")
-            return False
-        qty = positions[symbol]["qty"]
+            return None
+        pos = positions[symbol]
+        qty = int(pos["qty"])
+        fallback = float(
+            pos.get("current_price") or pos.get("avg_entry_price") or 0
+        )
         order_id = self.place_sell_order(symbol, qty, order_type="MARKET")
-        if order_id:
-            logger.info(f"Position CLOSED for {symbol} (Qty={qty})")
-            return True
-        return False
+        if not order_id:
+            return None
+
+        if self.paper is not None:
+            # Paper sell id is not a broker order; use mark used by portfolio.
+            fill = fallback
+            try:
+                quote = self.get_latest_quote(symbol)
+                if quote and quote.get("ltp"):
+                    fill = float(quote["ltp"])
+            except Exception:
+                pass
+            self.last_fill_price = fill
+            logger.info(f"Position CLOSED for {symbol} (Qty={qty}) @ {fill:.2f} paper")
+            return fill if fill > 0 else None
+
+        try:
+            self.confirm_live_order(order_id, symbol)
+        except Exception as e:
+            logger.debug(f"{symbol}: sell confirm warn: {e}")
+        fill = self.resolve_exit_fill_price(symbol, order_id, fallback=fallback)
+        self.last_fill_price = fill
+        if fill <= 0:
+            logger.warning(
+                f"Position CLOSED for {symbol} (Qty={qty}) but fill price unknown"
+            )
+            return None
+        logger.info(f"Position CLOSED for {symbol} (Qty={qty}) @ {fill:.2f}")
+        return fill
 
     def check_sl_tp(self, risk_mgr) -> list[str]:
         closed_symbols = []
@@ -1615,17 +1704,19 @@ class DhanBroker:
                     f"Entry={entry_price:.2f} Px={current_price:.2f} TP={tp_price:.2f}"
                 )
 
-            if reason and self.close_position(symbol):
-                closed_symbols.append(symbol)
-                risk_mgr.clear_trade(symbol)
-                try:
-                    import trade_journal
+            if reason:
+                fill = self.close_position(symbol)
+                if fill is not None:
+                    closed_symbols.append(symbol)
+                    risk_mgr.clear_trade(symbol)
+                    try:
+                        import trade_journal
 
-                    trade_journal.record_exit(
-                        "INDIA", symbol, current_price, reason=reason
-                    )
-                except Exception as je:
-                    logger.debug(f"Journal exit skip: {je}")
+                        trade_journal.record_exit(
+                            "INDIA", symbol, float(fill), reason=reason
+                        )
+                    except Exception as je:
+                        logger.debug(f"Journal exit skip: {je}")
 
         return closed_symbols
 
@@ -1891,7 +1982,16 @@ class DhanBroker:
         closed = []
         positions = self.get_open_positions()
         for symbol in list(positions.keys()):
-            if self.close_position(symbol):
+            fill = self.close_position(symbol)
+            if fill is not None:
                 closed.append(symbol)
-                logger.warning(f"[INDIA INTRADAY] Auto square-off {symbol}")
+                try:
+                    import trade_journal
+
+                    trade_journal.record_exit(
+                        "INDIA", symbol, float(fill), reason="squareoff"
+                    )
+                except Exception as je:
+                    logger.debug(f"Journal squareoff skip: {je}")
+                logger.warning(f"[INDIA INTRADAY] Auto square-off {symbol} @ {fill:.2f}")
         return closed

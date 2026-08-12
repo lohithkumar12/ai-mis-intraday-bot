@@ -220,6 +220,60 @@ def equity_curve(market: str | None = None, limit: int = 200) -> list[dict]:
     return data
 
 
+def list_open_trades(market: str) -> list[dict]:
+    """Open journal rows for a market (symbol, qty, entry_price, …)."""
+    with _lock, _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM trades
+            WHERE market=? AND status='open'
+            ORDER BY id ASC
+            """,
+            (market.upper(),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def reconcile_broker_flats(
+    market: str,
+    broker_open_symbols: set[str] | list[str] | None,
+    *,
+    price_lookup,
+    reason: str = "broker_flat",
+) -> list[str]:
+    """
+    Journal-exit any open trade whose symbol is no longer in broker open positions
+    (broker SL/TP, manual close on Dhan, etc.).
+    price_lookup(symbol) -> float exit mark (LTP / last known).
+    """
+    open_syms = {str(s).upper() for s in (broker_open_symbols or [])}
+    closed: list[str] = []
+    for row in list_open_trades(market):
+        symbol = str(row.get("symbol") or "").upper()
+        if not symbol or symbol in open_syms:
+            continue
+        entry = float(row.get("entry_price") or 0)
+        try:
+            px = float(price_lookup(symbol) or 0)
+        except Exception:
+            px = 0.0
+        if px <= 0:
+            px = entry
+        if px <= 0:
+            logger.warning(
+                f"[JOURNAL] skip broker_flat {market} {symbol}: no usable exit price"
+            )
+            continue
+        out = record_exit(market, symbol, px, reason=reason)
+        if out:
+            closed.append(symbol)
+            logger.warning(
+                f"[JOURNAL] {market} {symbol} closed vs broker flat @ {px:.2f} "
+                f"(reason={reason})"
+            )
+    return closed
+
+
 def realized_pnl_today(market: str, *, tz_name: str) -> float:
     """Sum closed-trade PnL for the local calendar day in tz_name.
 
