@@ -595,6 +595,30 @@ body {
 .pl-positive { color: var(--success); }
 .pl-negative { color: var(--danger); }
 
+.side-pill {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 8px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    vertical-align: middle;
+}
+
+.side-pill.side-buy {
+    background: var(--success-bg);
+    color: var(--success);
+    border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.side-pill.side-sell {
+    background: var(--danger-bg);
+    color: var(--danger);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
 /* ── Log Terminal ──────────────────────────────────────────────────────── */
 .log-terminal {
     background: #070a12;

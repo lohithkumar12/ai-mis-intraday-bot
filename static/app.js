@@ -336,10 +336,13 @@ function updatePositionsUI(positions, formatter, closeFnName) {
         const plSign = pos.unrealized_pl >= 0 ? "+" : "";
         const side = String(pos.side || "BUY").toUpperCase();
         const qtyText = side === "SELL" ? `-${Math.abs(Number(pos.qty || 0))}` : `${pos.qty}`;
+        const sideClass = side === "SELL" ? "side-sell" : "side-buy";
 
         rowsHtml += `
             <tr>
-                <td style="font-weight:700; color:var(--text-main);">${pos.symbol}</td>
+                <td style="font-weight:700; color:var(--text-main);">
+                    ${pos.symbol} <span class="side-pill ${sideClass}">${side}</span>
+                </td>
                 <td>${qtyText}</td>
                 <td>${formatter(pos.avg_entry_price)}</td>
                 <td>${formatter(pos.current_price)}</td>
