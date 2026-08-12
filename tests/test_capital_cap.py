@@ -22,6 +22,9 @@ class TestIndiaCapitalCap(unittest.TestCase):
 
     def test_sizing_uses_cap_not_full_book(self):
         rm = RiskManager(market="INDIA")
+        # Isolate from .env overrides captured at RiskManager.__init__
+        rm.risk_per_trade = 0.006
+        rm.max_position_pct = 1.0
         with patch.object(config, "INDIA_CAPITAL_CAP", 150_000):
             with patch.object(config, "MAX_SHARES_PER_ORDER", 10_000):
                 with patch.object(config, "MAX_POSITION_PCT", 1.0):

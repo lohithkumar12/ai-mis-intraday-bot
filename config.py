@@ -296,6 +296,10 @@ TAKE_PROFIT_R: float = _env_float("TAKE_PROFIT_R", "1.25")  # tighter than CNC s
 STOP_LOSS_PCT: float = _env_float("STOP_LOSS_PCT", "0.006")
 TAKE_PROFIT_PCT: float = _env_float("TAKE_PROFIT_PCT", "0.009")
 DAILY_DRAWDOWN_LIMIT: float = _env_float("DAILY_DRAWDOWN_LIMIT", "0.02")
+# Hard stops (0 = disabled). Count = journal entries opened today (IST).
+MAX_TRADES_PER_DAY: int = _env_int("MAX_TRADES_PER_DAY", "8")
+# Absolute ₹ loss hard stop (in addition to DAILY_DRAWDOWN_LIMIT %). 0 = off.
+MAX_DAILY_LOSS_INR: float = _env_float("MAX_DAILY_LOSS_INR", "0")
 MAX_SHARES_PER_ORDER: int = _env_int("MAX_SHARES_PER_ORDER", "500")
 MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", "2")
 MAX_CLUSTER_POSITIONS: int = _env_int("MAX_CLUSTER_POSITIONS", "2")
@@ -305,15 +309,24 @@ BUY_PENDING_COOLDOWN_SEC: int = _env_int("BUY_PENDING_COOLDOWN_SEC", "90")
 ORDER_CONFIRM_TIMEOUT_SEC: float = _env_float("ORDER_CONFIRM_TIMEOUT_SEC", "8")
 
 # Avoid first/last N minutes of the session (noise / poor fills)
-# MIS: skip open noise while OR builds; last ~45m ≈ no new entries after ~14:45
+# MIS: skip open noise while OR builds; last ~75m ≈ no new entries after ~14:15
 AVOID_OPEN_MINUTES: int = _env_int("AVOID_OPEN_MINUTES", "15")
-AVOID_CLOSE_MINUTES: int = _env_int("AVOID_CLOSE_MINUTES", "45")
+AVOID_CLOSE_MINUTES: int = _env_int("AVOID_CLOSE_MINUTES", "75")
 ALLOW_OPEN_CLOSE_WINDOW: bool = _env_bool("ALLOW_OPEN_CLOSE_WINDOW", "false")
 # Hard MIS entry cutoff HH:MM IST (no NEW entries after this, even if avoid-close allows)
-ENTRY_CUTOFF: str = os.getenv("ENTRY_CUTOFF", "14:45").strip()
-# Bot square-off start HH:MM IST (broker backup typically ~15:15–15:20)
-SQUAREOFF_TIME: str = os.getenv("SQUAREOFF_TIME", "15:10").strip()
+# Earlier than broker RMS (~15:15) so we are not racing square-off.
+ENTRY_CUTOFF: str = os.getenv("ENTRY_CUTOFF", "14:15").strip()
+# Bot square-off start HH:MM IST — MUST be before broker MIS cutoff (~15:15–15:20)
+SQUAREOFF_TIME: str = os.getenv("SQUAREOFF_TIME", "15:00").strip()
 DAILY_FLATTEN_ON_KILL: bool = _env_bool("DAILY_FLATTEN_ON_KILL", "true")
+# Sleep between flatten API calls (positions/orders) to avoid DH-904 / HTTP 429
+FLATTEN_API_GAP_SEC: float = _env_float("FLATTEN_API_GAP_SEC", "1.5")
+FLATTEN_RATE_LIMIT_BACKOFF_SEC: float = _env_float("FLATTEN_RATE_LIMIT_BACKOFF_SEC", "8")
+# Pre-trade cost floor: expected TP move must cover RT fees + min edge (₹/share equiv).
+# Approx MIS RT fees ~0.05% of notional + fixed; MIN_EDGE_BPS is extra buffer.
+COST_FLOOR_RT_PCT: float = _env_float("COST_FLOOR_RT_PCT", "0.0005")  # 5 bps RT
+COST_FLOOR_MIN_EDGE_BPS: float = _env_float("COST_FLOOR_MIN_EDGE_BPS", "5")  # 5 bps
+COST_FLOOR_ENABLED: bool = _env_bool("COST_FLOOR_ENABLED", "true")
 
 # Entry style: limit by default; market only if explicitly enabled
 ALLOW_MARKET_ENTRIES: bool = _env_bool("ALLOW_MARKET_ENTRIES", "false")

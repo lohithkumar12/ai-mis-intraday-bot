@@ -97,7 +97,10 @@ class TestBrokerStyleDayPl(unittest.TestCase):
                 trade_journal.record_entry("INDIA", "SBIN", 22, 1082.0)
                 trade_journal.record_exit("INDIA", "SBIN", 1082.4, reason="signal_sell")
                 trade_journal.record_entry("INDIA", "INFY", 20, 1189.10)
-                trade_journal.record_exit("INDIA", "INFY", 1189.10, reason="broker_flat")
+                # Simulate historical bad row (entry-as-exit) for resync repair path
+                trade_journal.record_exit(
+                    "INDIA", "INFY", 1189.10, reason="allow_entry_exit:broker_flat"
+                )
 
                 fills = {"SBIN": 1081.0, "INFY": 1186.40}
                 broker = MagicMock()
@@ -188,7 +191,9 @@ class TestRealizedPnlToday(unittest.TestCase):
         trade_journal.record_entry("INDIA", "SBIN", 22, 1082.0)
         trade_journal.record_exit("INDIA", "SBIN", 1082.4, reason="signal_sell")
         trade_journal.record_entry("INDIA", "INFY", 20, 1189.10)
-        trade_journal.record_exit("INDIA", "INFY", 1189.10, reason="broker_flat")
+        trade_journal.record_exit(
+            "INDIA", "INFY", 1189.10, reason="allow_entry_exit:broker_flat"
+        )
 
         fills = {"SBIN": 1081.0, "INFY": 1186.40}
         fixed = trade_journal.resync_today_exits_from_fills(
@@ -323,20 +328,28 @@ class TestOrbFireAfterFill(unittest.TestCase):
         )
 
     def test_signal_does_not_lock_until_mark_day_fired(self):
-        from strategy import OpeningRangeBreakoutStrategy, params_for_market
+        from strategy import (
+            OpeningRangeBreakoutStrategy,
+            params_for_market,
+            reset_orb_fired_for_tests,
+        )
         import config as cfg
 
         old_htf = cfg.ORB_USE_HTF_FILTER
         old_vol = cfg.VOLUME_MULT
         old_confirm = cfg.CONFIRM_BARS
+        old_journal = cfg.TRADE_JOURNAL_PATH
+        tmp = tempfile.TemporaryDirectory()
         try:
+            cfg.TRADE_JOURNAL_PATH = str(Path(tmp.name) / "j.db")
             cfg.ORB_USE_HTF_FILTER = False
             cfg.VOLUME_MULT = 0.0
             cfg.CONFIRM_BARS = 1
+            reset_orb_fired_for_tests()
             strat = OpeningRangeBreakoutStrategy(params_for_market("INDIA"))
             strat.use_htf = False
             strat.volume_mult = 0.0
-            strat._fired = {}
+            reset_orb_fired_for_tests()
             df = strat.compute_indicators(self._orb_breakout_df())
 
             sig1 = strat.generate_signal(df, "RELIANCE")
@@ -355,6 +368,9 @@ class TestOrbFireAfterFill(unittest.TestCase):
             cfg.ORB_USE_HTF_FILTER = old_htf
             cfg.VOLUME_MULT = old_vol
             cfg.CONFIRM_BARS = old_confirm
+            cfg.TRADE_JOURNAL_PATH = old_journal
+            reset_orb_fired_for_tests()
+            tmp.cleanup()
 
 
 if __name__ == "__main__":

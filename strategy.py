@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,19 @@ import pandas as pd
 import config
 
 logger = logging.getLogger(__name__)
+
+# Process-wide ORB day-fired locks (core + scout share one dict + disk file).
+_orb_fired_lock = threading.RLock()
+_orb_fired: dict[str, str] = {}
+_orb_fired_loaded = False
+
+
+def reset_orb_fired_for_tests() -> None:
+    """Clear shared ORB day-fired memory (+ optional disk via tests' temp journal path)."""
+    global _orb_fired_loaded
+    with _orb_fired_lock:
+        _orb_fired.clear()
+        _orb_fired_loaded = False
 
 
 # ---------------------------------------------------------------------------
@@ -476,12 +490,22 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         self.use_htf = bool(getattr(config, "ORB_USE_HTF_FILTER", True))
         self.htf_ema = int(getattr(config, "ORB_HTF_EMA_PERIOD", 20) or 20)
         # Day-key → side only after a confirmed broker fill (not on bare signal).
-        self._fired: dict[str, str] = {}
+        # Shared across all ORB instances via module-level _orb_fired.
         self.load_fired_state()
         logger.info(
             f"[{params.market}] ORB | or={self.or_minutes}m confirm={config.CONFIRM_BARS} "
             f"vol_mult={self.volume_mult} htf_ema={self.htf_ema if self.use_htf else 'off'}"
         )
+
+    @property
+    def _fired(self) -> dict[str, str]:
+        return _orb_fired
+
+    @_fired.setter
+    def _fired(self, value: dict[str, str]) -> None:
+        global _orb_fired
+        with _orb_fired_lock:
+            _orb_fired = dict(value or {})
 
     def _fire_key(self, symbol: str, day=None) -> str:
         if day is None:
@@ -499,13 +523,18 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         if side_u not in ("BUY", "SELL"):
             return
         key = self._fire_key(symbol, day=day)
-        self._fired[key] = side_u
-        logger.info(f"[ORB] marked fired {key}={side_u} (after confirmed fill)")
-        self._persist_fired()
+        with _orb_fired_lock:
+            _orb_fired[key] = side_u
+            logger.info(f"[ORB] marked fired {key}={side_u} (after confirmed fill)")
+            self._persist_fired()
 
     def has_day_fired(self, symbol: str, side: str | None = None, day=None) -> bool:
+        # Reload from disk so core/scout (separate strategy wrappers) stay in sync
+        # after the other loop marks a fill, and across process restarts.
+        self.load_fired_state()
         key = self._fire_key(symbol, day=day)
-        got = self._fired.get(key)
+        with _orb_fired_lock:
+            got = _orb_fired.get(key)
         if not got:
             return False
         if side is None:
@@ -527,24 +556,55 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             except Exception:
                 today = str(datetime.now(timezone.utc).date())
             # keys are SYMBOL:date — keep only today
-            keep = {k: v for k, v in self._fired.items() if str(k).split(":")[-1] == today}
-            self._fired = keep
-            path.write_text(json.dumps(self._fired), encoding="utf-8")
+            with _orb_fired_lock:
+                keep = {
+                    k: v
+                    for k, v in _orb_fired.items()
+                    if str(k).split(":")[-1] == today
+                }
+                _orb_fired.clear()
+                _orb_fired.update(keep)
+                payload = dict(_orb_fired)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(path)
         except Exception as e:
             logger.debug(f"ORB fired persist skip: {e}")
 
     def load_fired_state(self) -> None:
+        global _orb_fired_loaded
         try:
             path = self._fired_state_path()
             if not path.is_file():
+                _orb_fired_loaded = True
                 return
             raw = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                self._fired = {str(k): str(v) for k, v in raw.items()}
-                self._persist_fired()  # prune old days
-                logger.info(f"[ORB] restored {len(self._fired)} day-fired locks")
+            if not isinstance(raw, dict):
+                _orb_fired_loaded = True
+                return
+            try:
+                from zoneinfo import ZoneInfo
+                today = str(datetime.now(ZoneInfo("Asia/Kolkata")).date())
+            except Exception:
+                today = str(datetime.now(timezone.utc).date())
+            with _orb_fired_lock:
+                # Merge disk → memory (other instance may have written newer keys)
+                for k, v in raw.items():
+                    ks, vs = str(k), str(v)
+                    if ks.split(":")[-1] != today:
+                        continue
+                    _orb_fired[ks] = vs
+                # Prune stale in-memory keys
+                stale = [k for k in _orb_fired if str(k).split(":")[-1] != today]
+                for k in stale:
+                    _orb_fired.pop(k, None)
+                n = len(_orb_fired)
+            if not _orb_fired_loaded:
+                logger.info(f"[ORB] restored {n} day-fired locks from {path}")
+            _orb_fired_loaded = True
         except Exception as e:
             logger.debug(f"ORB fired load skip: {e}")
+            _orb_fired_loaded = True
 
     @staticmethod
     def _timeframe_minutes() -> int:
@@ -640,6 +700,9 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         if "VOL_AVG" not in df.columns:
             df = self.compute_indicators(df)
 
+        # Sync shared day-fired locks (core ↔ scout ↔ disk) before signal.
+        self.load_fired_state()
+
         # Never use the forming candle for ORB confirm / volume / HTF bias.
         df = self.completed_bars_only(df)
         if df is None or len(df) < need:
@@ -692,7 +755,9 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
 
         # Do NOT mark _fired here — only after confirmed fill via mark_day_fired().
         # Failed/rejected buys must be allowed to retry while the breakout holds.
-        if long_ok and self._fired.get(key) != "BUY":
+        with _orb_fired_lock:
+            fired_side = _orb_fired.get(key)
+        if long_ok and fired_side != "BUY":
             if bias == "SELL":
                 return "HOLD"
             logger.info(
@@ -701,7 +766,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             )
             return "BUY"
 
-        if self.allow_short and short_ok and self._fired.get(key) != "SELL":
+        if self.allow_short and short_ok and fired_side != "SELL":
             if bias == "BUY":
                 return "HOLD"
             logger.info(
@@ -710,7 +775,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             return "SELL"
 
         # Soft exit: close back inside range after we fired long (optional)
-        if config.STRICT_SELL and self._fired.get(key) == "BUY":
+        if config.STRICT_SELL and fired_side == "BUY":
             if float(latest["close"]) < or_high and float(latest.get(f"RSI_{self.p.rsi_period}", 50) or 50) > self.p.rsi_sell:
                 return "SELL"
         return "HOLD"

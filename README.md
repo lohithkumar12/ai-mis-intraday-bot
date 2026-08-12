@@ -8,7 +8,7 @@ Same **architecture** as [`New_StartUp`](../New_StartUp) (CNC swing), dedicated 
 |---------------------|-------------------|
 | Flat modules: `main.py`, `config.py`, `dhan_broker.py`, … | `INDIA_PRODUCT_TYPE=INTRADAY` |
 | Double live gate | `opening_range_breakout` + `TIMEFRAME=5` |
-| Flask dashboard + journal + scout | `ENTRY_CUTOFF=14:45`, `SQUAREOFF_TIME=15:10` |
+| Flask dashboard + journal + scout | `ENTRY_CUTOFF=14:15`, `SQUAREOFF_TIME=15:00` |
 | | `INDIA_CAPITAL_CAP` sleeve for sizing + daily DD |
 | | Docker: `ai_mis_intraday_bot` on host **port 81** (CNC often uses 80) |
 
@@ -55,13 +55,18 @@ docker compose logs -f bot
 |-----|------|
 | `INDIA_CAPITAL_CAP` | Max equity used for MIS sizing + daily DD base |
 | `INDIA_PAPER` / `LIVE_*` | Paper until double-armed |
-| `ENTRY_CUTOFF` / `SQUAREOFF_TIME` | No new entries after 14:45; flatten ~15:10 |
-| `INDIA_SCOUT_AUTO_BUY` | `false` by default (quieter first runs) |
+| `ENTRY_CUTOFF` / `SQUAREOFF_TIME` | No new entries after **14:15**; flatten from **15:00** (before broker RMS ~15:15) |
+| `INDIA_SCOUT_AUTO_BUY` | Keep **`false`** unless you explicitly want scout auto-fills |
+| `MAX_TRADES_PER_DAY` | Hard cap on journal entries/day (default 8) |
+| `MAX_DAILY_LOSS_INR` | Optional absolute ₹ kill (0=off); DD% still applies |
+| `COST_FLOOR_*` | Skip entries whose TP move cannot cover RT fees + min edge |
+
+**Ops:** do **not** mid-session redeploy / `docker compose up --build` while MIS positions are open — kill-switch is now disk-persisted for the IST day, but ORB/meta races and RMS square-off windows still hurt. Restart only when **flat** or after market.
 
 ## Tests
 
 ```bash
-python -m unittest tests.test_mis_session tests.test_nse_tick tests.test_order_guards tests.test_zero_ltp_sl -v
+python -m unittest tests.test_mis_session tests.test_safety_fixes tests.test_day_pl tests.test_nse_tick tests.test_order_guards tests.test_zero_ltp_sl -v
 ```
 
 No fixed daily profit — expectancy + risk caps only.

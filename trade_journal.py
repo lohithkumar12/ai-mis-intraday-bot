@@ -135,6 +135,15 @@ def record_exit(
     qty: int | None = None,
 ) -> Optional[dict]:
     """Close the most recent open trade for symbol/market. Returns closed row dict."""
+    try:
+        px = float(exit_price)
+    except (TypeError, ValueError):
+        px = 0.0
+    if px <= 0:
+        logger.error(
+            f"[JOURNAL] refuse exit for {market} {symbol}: invalid exit_price={exit_price!r}"
+        )
+        return None
     now = datetime.now(timezone.utc).isoformat()
     with _lock, _conn() as conn:
         row = conn.execute(
@@ -150,14 +159,24 @@ def record_exit(
             return None
 
         entry = float(row["entry_price"] or 0)
+        # Never silently journal exit @ entry (false +0 PnL). Callers must pass a
+        # real broker fill / LTP; use allow_entry_exit=True only for tests/repair.
+        if entry > 0 and abs(px - entry) < 1e-9 and not (
+            str(reason or "").startswith("allow_entry_exit")
+        ):
+            logger.error(
+                f"[JOURNAL] refuse exit @ entry for {market} {symbol} "
+                f"(entry={entry:.2f}) reason={reason!r} — need broker fill"
+            )
+            return None
         q = int(qty if qty is not None else row["qty"])
         side = str(row["side"] or "BUY").upper()
         if side == "SELL":
-            pnl = (entry - exit_price) * q
-            pnl_pct = ((entry - exit_price) / entry) if entry else 0.0
+            pnl = (entry - px) * q
+            pnl_pct = ((entry - px) / entry) if entry else 0.0
         else:
-            pnl = (exit_price - entry) * q
-            pnl_pct = ((exit_price - entry) / entry) if entry else 0.0
+            pnl = (px - entry) * q
+            pnl_pct = ((px - entry) / entry) if entry else 0.0
         entry_reason = row["reason"] or ""
         try:
             meta = json.loads(row["meta_json"] or "{}")
@@ -177,7 +196,7 @@ def record_exit(
             WHERE id=?
             """,
             (
-                exit_price,
+                px,
                 pnl,
                 pnl_pct,
                 reason_final,
@@ -196,7 +215,7 @@ def record_exit(
             "exit_side": "BUY" if side == "SELL" else "SELL",
             "qty": q,
             "entry_price": entry,
-            "exit_price": exit_price,
+            "exit_price": px,
             "pnl": pnl,
             "pnl_pct": pnl_pct,
             "reason": reason_final,
@@ -270,6 +289,71 @@ def list_open_trades(market: str) -> list[dict]:
             (market.upper(),),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def _opened_at_local_date(raw: str, tz) -> Optional[date]:
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(tz).date()
+    except Exception:
+        return None
+
+
+def entries_today(
+    market: str,
+    *,
+    tz_name: str = "Asia/Kolkata",
+    symbol: str | None = None,
+) -> list[dict]:
+    """Journal rows (open or closed) whose opened_at falls on today's local date."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+    today = datetime.now(tz).date()
+    with _lock, _conn() as conn:
+        if symbol:
+            rows = conn.execute(
+                """
+                SELECT * FROM trades
+                WHERE market=? AND UPPER(symbol)=?
+                ORDER BY id DESC
+                """,
+                (market.upper(), str(symbol).upper()),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE market=? ORDER BY id DESC",
+                (market.upper(),),
+            ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if _opened_at_local_date(d.get("opened_at") or "", tz) == today:
+            out.append(d)
+    return out
+
+
+def has_entry_today(
+    market: str,
+    symbol: str,
+    *,
+    tz_name: str = "Asia/Kolkata",
+) -> bool:
+    """True if journal already recorded an entry for symbol today (blocks re-buy)."""
+    return bool(entries_today(market, tz_name=tz_name, symbol=symbol))
+
+
+def count_entries_today(
+    market: str,
+    *,
+    tz_name: str = "Asia/Kolkata",
+) -> int:
+    return len(entries_today(market, tz_name=tz_name))
 
 
 def reconcile_broker_flats(

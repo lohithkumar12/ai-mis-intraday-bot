@@ -2,16 +2,22 @@
 bot_state.py — Shared in-process state for bot loops + dashboard
 ================================================================
 Thread-safe signal cache, health timestamps, and India SOD equity.
+Kill-switch is persisted under the journal data dir so Docker restarts
+do not clear a same-IST-day daily_drawdown latch.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import threading
 import time
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 _lock = threading.Lock()
+_log = logging.getLogger(__name__)
 
 _signals: dict[str, dict[str, Any]] = {}  # market -> {symbol: payload}
 _scout: dict[str, Any] = {}  # market -> near-setups blob (display only)
@@ -29,6 +35,97 @@ _india_sod: dict[str, Any] = {"date": None, "equity": None}
 _us_sod: dict[str, Any] = {"date": None, "equity": None}
 # Shared kill-switch (loop + dashboard must use the same flag)
 _kill: dict[str, dict[str, Any]] = {}
+_kill_loaded = False
+
+
+def _trading_day_iso(market: str) -> str:
+    """IST calendar day for India; NY for US; local date otherwise."""
+    key = str(market or "").upper()
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo  # type: ignore
+    if key == "INDIA":
+        return datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    if key == "US":
+        return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    return date.today().isoformat()
+
+
+def _kill_state_path() -> Path:
+    try:
+        import config
+
+        journal = Path(str(getattr(config, "TRADE_JOURNAL_PATH", "trade_journal.db")))
+    except Exception:
+        journal = Path("trade_journal.db")
+    return journal.expanduser().resolve().parent / "kill_switch.json"
+
+
+def _persist_kill_unlocked() -> None:
+    """Write _kill to disk (caller holds _lock)."""
+    try:
+        path = _kill_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            k: {
+                "active": bool(v.get("active")),
+                "reason": str(v.get("reason") or "")[:200],
+                "day": v.get("day"),
+            }
+            for k, v in _kill.items()
+        }
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(path)
+    except Exception as e:
+        _log.warning(f"kill_switch persist failed: {e}")
+
+
+def _load_kill_from_disk_unlocked() -> None:
+    """Merge disk state for today's trading day into memory (caller holds _lock)."""
+    global _kill_loaded
+    path = _kill_state_path()
+    if not path.is_file():
+        _kill_loaded = True
+        return
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            _kill_loaded = True
+            return
+        for market, row in raw.items():
+            if not isinstance(row, dict):
+                continue
+            key = str(market).upper()
+            day = str(row.get("day") or "")
+            today = _trading_day_iso(key)
+            if day != today:
+                # Stale prior-day latch — leave inactive in memory; prune on next persist
+                continue
+            if bool(row.get("active")):
+                _kill[key] = {
+                    "active": True,
+                    "reason": str(row.get("reason") or "")[:200],
+                    "day": day,
+                }
+        _kill_loaded = True
+        active = [k for k, v in _kill.items() if v.get("active")]
+        if active:
+            _log.warning(
+                f"Restored kill-switch from disk for today: {active} "
+                f"({path})"
+            )
+    except Exception as e:
+        _log.warning(f"kill_switch load failed: {e}")
+        _kill_loaded = True
+
+
+def ensure_kill_loaded() -> None:
+    """Idempotent disk hydrate (call on startup / before checks)."""
+    with _lock:
+        if not _kill_loaded:
+            _load_kill_from_disk_unlocked()
 
 
 def publish_signals(market: str, items: list[dict]) -> None:
@@ -140,20 +237,42 @@ def reset_sod_for_tests() -> None:
 
 
 def reset_kill_for_tests() -> None:
+    global _kill_loaded
     with _lock:
         _kill.clear()
+        _kill_loaded = True
+        # Best-effort wipe of persist file so unit tests stay isolated
+        try:
+            path = _kill_state_path()
+            if path.is_file():
+                path.unlink()
+        except Exception:
+            pass
 
 
 def is_kill_switch_active(market: str) -> bool:
     key = str(market or "").upper()
     with _lock:
+        if not _kill_loaded:
+            _load_kill_from_disk_unlocked()
         row = _kill.get(key) or {}
-        return bool(row.get("active"))
+        if not row.get("active"):
+            return False
+        # Stale latch from a prior trading day → clear
+        day = str(row.get("day") or "")
+        today = _trading_day_iso(key)
+        if day and day != today:
+            _kill[key] = {"active": False, "reason": "", "day": None}
+            _persist_kill_unlocked()
+            return False
+        return True
 
 
 def kill_switch_reason(market: str) -> str:
     key = str(market or "").upper()
     with _lock:
+        if not _kill_loaded:
+            _load_kill_from_disk_unlocked()
         row = _kill.get(key) or {}
         return str(row.get("reason") or "")
 
@@ -161,17 +280,28 @@ def kill_switch_reason(market: str) -> str:
 def activate_kill_switch(market: str, reason: str = "manual") -> None:
     key = str(market or "").upper()
     with _lock:
+        if not _kill_loaded:
+            _load_kill_from_disk_unlocked()
         _kill[key] = {
             "active": True,
             "reason": str(reason or "manual")[:200],
-            "day": date.today().isoformat(),
+            "day": _trading_day_iso(key),
         }
+        _persist_kill_unlocked()
+        _log.critical(
+            f"[{key}] Kill switch ACTIVATED ({_kill[key]['reason']}) "
+            f"day={_kill[key]['day']} — persisted"
+        )
 
 
 def reset_kill_switch(market: str) -> None:
+    """Clear latch (caller should gate to new trading day only for daily_drawdown)."""
     key = str(market or "").upper()
     with _lock:
+        if not _kill_loaded:
+            _load_kill_from_disk_unlocked()
         _kill[key] = {"active": False, "reason": "", "day": None}
+        _persist_kill_unlocked()
 
 
 def _rebaseline_sod_if_needed(

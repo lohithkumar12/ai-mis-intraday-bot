@@ -1946,6 +1946,7 @@ class DhanBroker:
             )
             order_id = self._extract_order_id(raw)
             if not order_id:
+                self.last_error = f"Sell rejected: {raw}"
                 logger.error(f"SELL rejected for {symbol}: {raw}")
                 return None
             logger.warning(
@@ -1954,6 +1955,7 @@ class DhanBroker:
             )
             return order_id
         except Exception as e:
+            self.last_error = f"Sell exception: {e}"
             logger.error(f"Failed to place SELL for {symbol}: {e}", exc_info=True)
             return None
 
@@ -2517,59 +2519,191 @@ class DhanBroker:
             return round((price * qty) / 4.0, 2)  # ~4x MTF leverage
         return round(price * qty, 2)  # 1x CNC full value
 
+    @staticmethod
+    def _is_mis_cutoff_reject(err: str) -> bool:
+        msg = str(err or "").lower()
+        return (
+            "intraday orders cannot be placed" in msg
+            or "rms:" in msg and "intraday" in msg
+            or "after market" in msg
+            or "market closed" in msg
+        )
+
+    @staticmethod
+    def _is_rate_limit_err(err: str) -> bool:
+        msg = str(err or "").upper()
+        return (
+            "429" in msg
+            or "DH-904" in msg
+            or "RATE LIMIT" in msg
+            or "TOO MANY REQUESTS" in msg
+        )
+
     def square_off_intraday_positions(self) -> list[str]:
         """
         Auto square-off for INTRADAY product before broker cutoff (~15:15 IST).
         Live MIS is also squared off by the broker; this covers paper + soft closes.
         Verifies broker is flat after each close attempt.
+        On RMS/cutoff REJECT: does NOT journal closed; records last_squareoff_failed.
         """
+        self.last_squareoff_failed = []
         if (config.INDIA_PRODUCT_TYPE or "CNC").upper() not in ("INTRADAY", "INTRA", "MIS"):
             return []
         closed = []
+        failed: list[str] = []
+        gap = float(getattr(config, "FLATTEN_API_GAP_SEC", 1.5) or 0)
+        backoff = float(getattr(config, "FLATTEN_RATE_LIMIT_BACKOFF_SEC", 8) or 8)
+
         positions = self.get_open_positions()
         if positions is None:
-            logger.warning("[INDIA INTRADAY] square-off skipped: positions unavailable")
-            return closed
+            err = str(getattr(self, "last_error", "") or "")
+            if self._is_rate_limit_err(err):
+                logger.warning(
+                    f"[INDIA INTRADAY] square-off positions 429/DH-904 — sleep {backoff:.0f}s"
+                )
+                time.sleep(backoff)
+                positions = self.get_open_positions()
+            if positions is None:
+                logger.warning("[INDIA INTRADAY] square-off skipped: positions unavailable")
+                return closed
+
         for symbol in list(positions.keys()):
+            if gap > 0:
+                time.sleep(gap)
+            entry = float((positions.get(symbol) or {}).get("avg_entry_price") or 0)
+            self.last_error = ""
             fill = self.close_position(symbol)
+            err = str(getattr(self, "last_error", "") or "")
+
+            if fill is None and self._is_rate_limit_err(err):
+                logger.warning(
+                    f"[INDIA INTRADAY] {symbol} close hit rate limit — backoff {backoff:.0f}s"
+                )
+                time.sleep(backoff)
+                self.last_error = ""
+                fill = self.close_position(symbol)
+                err = str(getattr(self, "last_error", "") or "")
+
             # Verify flat even if fill unknown (broker may have closed)
+            if gap > 0:
+                time.sleep(min(gap, 1.0))
             verify = self.get_open_positions()
+            if verify is None and self._is_rate_limit_err(
+                str(getattr(self, "last_error", "") or "")
+            ):
+                time.sleep(backoff)
+                verify = self.get_open_positions()
             still_open = bool(verify is not None and symbol in verify)
+
             if fill is not None and not still_open:
+                px = float(fill)
+                # Prefer broker fill history if close returned entry-like mark
+                if entry > 0 and abs(px - entry) < 1e-6:
+                    try:
+                        hist = float(self.latest_sell_fill_price(symbol) or 0)
+                        if hist > 0 and abs(hist - entry) > 1e-6:
+                            px = hist
+                    except Exception:
+                        pass
+                if entry > 0 and abs(px - entry) < 1e-9:
+                    logger.error(
+                        f"[INDIA INTRADAY] {symbol} flat but refuse journal @ entry "
+                        f"{entry:.2f} — leaving journal open for fill resync"
+                    )
+                    closed.append(symbol)
+                    continue
                 closed.append(symbol)
                 try:
                     import trade_journal
 
                     qty = int(getattr(self, "last_fill_qty", 0) or 0) or None
                     trade_journal.record_exit(
-                        "INDIA", symbol, float(fill), reason="squareoff", qty=qty
+                        "INDIA", symbol, float(px), reason="squareoff", qty=qty
                     )
                 except Exception as je:
                     logger.debug(f"Journal squareoff skip: {je}")
-                logger.warning(f"[INDIA INTRADAY] Auto square-off {symbol} @ {fill:.2f}")
+                logger.warning(f"[INDIA INTRADAY] Auto square-off {symbol} @ {px:.2f}")
             elif still_open:
-                logger.error(
-                    f"[INDIA INTRADAY] square-off VERIFY FAILED — {symbol} still open"
-                )
-                # one retry
-                fill2 = self.close_position(symbol)
-                verify2 = self.get_open_positions()
-                if verify2 is not None and symbol not in verify2 and fill2 is not None:
-                    closed.append(symbol)
+                if self._is_mis_cutoff_reject(err):
+                    logger.critical(
+                        f"[INDIA INTRADAY] SQUARE-OFF REJECTED (RMS/cutoff) for {symbol}: "
+                        f"{err} — NOT marking journal closed; broker may auto-flat"
+                    )
                     try:
-                        import trade_journal
+                        import alerts
 
-                        trade_journal.record_exit(
-                            "INDIA", symbol, float(fill2), reason="squareoff"
+                        alerts.notify(
+                            f"SQUAREOFF REJECTED {symbol}: {err[:180]}",
+                            event="squareoff_reject",
                         )
                     except Exception:
                         pass
-                    logger.warning(
-                        f"[INDIA INTRADAY] Auto square-off retry OK {symbol} @ {fill2:.2f}"
-                    )
+                    failed.append(symbol)
+                    continue
+                logger.error(
+                    f"[INDIA INTRADAY] square-off VERIFY FAILED — {symbol} still open "
+                    f"err={err or 'n/a'}"
+                )
+                # one retry with gap
+                time.sleep(max(gap, 1.0))
+                fill2 = self.close_position(symbol)
+                err2 = str(getattr(self, "last_error", "") or "")
+                if self._is_rate_limit_err(err2):
+                    time.sleep(backoff)
+                    fill2 = self.close_position(symbol)
+                    err2 = str(getattr(self, "last_error", "") or "")
+                time.sleep(min(gap, 1.0) if gap > 0 else 0.5)
+                verify2 = self.get_open_positions()
+                if verify2 is not None and symbol not in verify2 and fill2 is not None:
+                    px2 = float(fill2)
+                    if entry > 0 and abs(px2 - entry) < 1e-9:
+                        logger.error(
+                            f"[INDIA INTRADAY] retry flat {symbol} but refuse journal @ entry"
+                        )
+                        closed.append(symbol)
+                    else:
+                        closed.append(symbol)
+                        try:
+                            import trade_journal
+
+                            trade_journal.record_exit(
+                                "INDIA", symbol, px2, reason="squareoff"
+                            )
+                        except Exception:
+                            pass
+                        logger.warning(
+                            f"[INDIA INTRADAY] Auto square-off retry OK {symbol} @ {px2:.2f}"
+                        )
+                else:
+                    if self._is_mis_cutoff_reject(err2):
+                        logger.critical(
+                            f"[INDIA INTRADAY] SQUARE-OFF RETRY REJECTED (RMS) {symbol}: {err2}"
+                        )
+                        try:
+                            import alerts
+
+                            alerts.notify(
+                                f"SQUAREOFF RETRY REJECTED {symbol}: {err2[:180]}",
+                                event="squareoff_reject",
+                            )
+                        except Exception:
+                            pass
+                    failed.append(symbol)
             elif fill is not None and verify is None:
                 logger.warning(
                     f"[INDIA INTRADAY] {symbol} close submitted @ {fill:.2f} "
                     f"but positions unverifiable"
                 )
+            elif fill is None and not still_open and verify is not None:
+                # Already flat (broker RMS beat us) — reconcile via journal helper later
+                logger.warning(
+                    f"[INDIA INTRADAY] {symbol} already flat at broker (no bot fill)"
+                )
+                closed.append(symbol)
+
+        self.last_squareoff_failed = failed
+        if failed:
+            logger.critical(
+                f"[INDIA INTRADAY] square-off incomplete — still open/rejected: {failed}"
+            )
         return closed

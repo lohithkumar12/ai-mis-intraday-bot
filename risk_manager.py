@@ -518,18 +518,84 @@ class RiskManager:
 
     @staticmethod
     def squareoff_hm() -> tuple[int, int]:
-        raw = getattr(config, "SQUAREOFF_TIME", "15:10") or "15:10"
+        raw = getattr(config, "SQUAREOFF_TIME", "15:00") or "15:00"
         try:
             hh, mm = raw.split(":")[:2]
             return int(hh), int(mm)
         except Exception:
-            return 15, 10
+            return 15, 0
 
     def past_squareoff(self, now: datetime | None = None) -> bool:
         if now is None:
             now = datetime.now()
         hh, mm = self.squareoff_hm()
         return (now.hour * 60 + now.minute) >= (hh * 60 + mm)
+
+    # -----------------------------------------------------------------------
+    # Trade count / absolute loss / cost floor
+    # -----------------------------------------------------------------------
+    def passes_cost_floor(
+        self,
+        entry_price: float,
+        take_profit_price: float,
+        *,
+        qty: int = 1,
+    ) -> tuple[bool, str]:
+        """
+        Expected move to TP must cover round-trip fee estimate + min edge.
+        Simple MIS cost guard — not a full fee model.
+        """
+        if not bool(getattr(config, "COST_FLOOR_ENABLED", True)):
+            return True, ""
+        entry = float(entry_price or 0)
+        tp = float(take_profit_price or 0)
+        if entry <= 0 or tp <= entry:
+            return False, "cost_floor: invalid entry/tp"
+        move_pct = (tp - entry) / entry
+        rt = float(getattr(config, "COST_FLOOR_RT_PCT", 0.0005) or 0)
+        edge_bps = float(getattr(config, "COST_FLOOR_MIN_EDGE_BPS", 5) or 0)
+        need = rt + (edge_bps / 10_000.0)
+        if move_pct + 1e-12 < need:
+            return (
+                False,
+                f"cost_floor: TP move {move_pct:.3%} < need {need:.3%} "
+                f"(rt={rt:.3%}+edge={edge_bps:.0f}bps)",
+            )
+        return True, ""
+
+    def check_max_trades_per_day(self) -> tuple[bool, str]:
+        """False when journal entries today >= MAX_TRADES_PER_DAY (0=unlimited)."""
+        cap = int(getattr(config, "MAX_TRADES_PER_DAY", 0) or 0)
+        if cap <= 0 or self.market != "INDIA":
+            return True, ""
+        try:
+            import trade_journal
+
+            n = int(trade_journal.count_entries_today("INDIA"))
+        except Exception as e:
+            logger.debug(f"max_trades count skip: {e}")
+            return True, ""
+        if n >= cap:
+            return False, f"max_trades_per_day {n}>={cap}"
+        return True, ""
+
+    def check_max_daily_loss_inr(self, day_pl: float | None) -> bool:
+        """
+        Absolute ₹ hard stop. Returns True when limit breached (kill ON).
+        MAX_DAILY_LOSS_INR=0 disables.
+        """
+        lim = float(getattr(config, "MAX_DAILY_LOSS_INR", 0) or 0)
+        if lim <= 0 or day_pl is None:
+            return False
+        loss = max(0.0, -float(day_pl))
+        if loss + 1e-9 >= lim:
+            reason = f"max_daily_loss_inr ₹{loss:,.0f}>=₹{lim:,.0f}"
+            bot_state.activate_kill_switch(self.market, reason)
+            logger.critical(
+                f"MAX DAILY LOSS INR KILL-SWITCH! loss=₹{loss:,.2f} limit=₹{lim:,.0f}"
+            )
+            return True
+        return False
 
     # -----------------------------------------------------------------------
     # Position / cluster limits
@@ -643,11 +709,19 @@ class RiskManager:
             )
             return True
 
-        # Latch: once daily_drawdown trips, do NOT auto-clear on recovery.
+        # Absolute ₹ hard stop (optional)
+        if self.check_max_daily_loss_inr(day_pl):
+            return True
+
+        # Latch: once daily_drawdown / max_daily_loss trips, do NOT auto-clear on recovery.
         # Reset only on next trading day via reset_kill_switch().
         if bot_state.is_kill_switch_active(self.market):
             prev_reason = bot_state.kill_switch_reason(self.market)
-            if prev_reason.startswith("daily_drawdown") or prev_reason == "invalid_sod":
+            if (
+                prev_reason.startswith("daily_drawdown")
+                or prev_reason.startswith("max_daily_loss")
+                or prev_reason == "invalid_sod"
+            ):
                 logger.warning(
                     f"[{self.market}] Kill switch still latched ({prev_reason}) — "
                     f"current DD {drawdown:.2%} ({dd_note})"

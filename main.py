@@ -159,6 +159,35 @@ def _india_try_buy(
         logger.info(f"{symbol}: BUY skipped — kill switch active")
         return False
 
+    # One entry per symbol per IST day (journal) — survives restarts / core+scout
+    try:
+        if trade_journal.has_entry_today("INDIA", symbol):
+            logger.info(
+                f"{symbol}: BUY skipped — journal already has an entry today"
+            )
+            if hasattr(strategy, "mark_day_fired"):
+                try:
+                    strategy.mark_day_fired(symbol, "BUY")
+                except Exception:
+                    pass
+            return False
+    except Exception as e:
+        logger.debug(f"{symbol}: has_entry_today check skip: {e}")
+
+    # ORB day-fired shared lock (reload from disk)
+    if hasattr(strategy, "has_day_fired"):
+        try:
+            if strategy.has_day_fired(symbol, "BUY"):
+                logger.info(f"{symbol}: BUY skipped — ORB already fired today")
+                return False
+        except Exception as e:
+            logger.debug(f"{symbol}: has_day_fired check skip: {e}")
+
+    ok_n, why_n = risk_mgr.check_max_trades_per_day()
+    if not ok_n:
+        logger.info(f"{symbol}: BUY skipped — {why_n}")
+        return False
+
     blocked, block_reason = order_guards.is_buy_blocked(symbol)
     if blocked:
         logger.info(f"{symbol}: BUY skipped — {block_reason}")
@@ -185,6 +214,10 @@ def _india_try_buy(
     sizing_equity = risk_mgr.effective_equity(sizing_equity)
     sl = risk_mgr.get_stop_loss_price(limit_price, atr)
     tp = risk_mgr.get_take_profit_price(limit_price, stop_loss_price=sl, atr=atr)
+    ok_cf, why_cf = risk_mgr.passes_cost_floor(limit_price, tp)
+    if not ok_cf:
+        logger.info(f"{symbol}: BUY skipped — {why_cf}")
+        return False
     stop_dist = limit_price - sl
     qty = risk_mgr.calculate_position_size(
         sizing_equity, limit_price, stop_distance=stop_dist
@@ -308,7 +341,16 @@ def _india_try_buy(
 
 
 def _india_restore_runtime_state(india_broker, risk_mgr, strategy) -> None:
-    """Load persisted meta / ORB locks and reconcile against live broker positions."""
+    """Load persisted meta / ORB locks / kill latch and reconcile broker positions."""
+    try:
+        bot_state.ensure_kill_loaded()
+        if bot_state.is_kill_switch_active("INDIA"):
+            logger.critical(
+                f"[INDIA] Kill switch restored from disk: "
+                f"{bot_state.kill_switch_reason('INDIA')} — no new entries today"
+            )
+    except Exception as e:
+        logger.debug(f"kill load: {e}")
     try:
         risk_mgr.load_state()
     except Exception as e:
@@ -318,6 +360,15 @@ def _india_restore_runtime_state(india_broker, risk_mgr, strategy) -> None:
             strategy.load_fired_state()
         except Exception as e:
             logger.debug(f"ORB fired load: {e}")
+    # Also mark ORB fired for any journal entries already taken today
+    try:
+        if strategy is not None and hasattr(strategy, "mark_day_fired"):
+            for row in trade_journal.entries_today("INDIA"):
+                sym = str(row.get("symbol") or "")
+                if sym:
+                    strategy.mark_day_fired(sym, "BUY")
+    except Exception as e:
+        logger.debug(f"ORB seed from journal: {e}")
     try:
         positions = india_broker.get_open_positions()
     except Exception as e:
@@ -377,10 +428,27 @@ def _india_try_sell(
         logger.info(f"{symbol}: SELL skipped — exit already in flight")
         return False
     pos = current_positions[symbol]
-    fallback = float(pos.get("current_price") or pos.get("avg_entry_price") or 0)
+    entry = float(pos.get("avg_entry_price") or 0)
+    fallback = float(pos.get("current_price") or 0)
     fill = india_broker.close_position(symbol)
     if fill is not None:
-        px = float(fill) if float(fill) > 0 else fallback
+        px = float(fill) if float(fill) > 0 else 0.0
+        if px <= 0:
+            try:
+                px = float(india_broker.latest_sell_fill_price(symbol) or 0)
+            except Exception:
+                px = 0.0
+        if px <= 0 and fallback > 0 and (entry <= 0 or abs(fallback - entry) > 1e-6):
+            px = fallback
+        if px <= 0 or (entry > 0 and abs(px - entry) < 1e-9):
+            logger.error(
+                f"{symbol}: SELL filled but refuse journal @ entry/unknown "
+                f"(fill={fill} entry={entry}) — will resync later"
+            )
+            # Position may be flat at broker; clear local meta but leave journal open
+            risk_mgr.clear_trade(symbol)
+            current_positions.pop(symbol, None)
+            return True
         qty = int(getattr(india_broker, "last_fill_qty", 0) or pos.get("qty") or 0) or None
         trade_journal.record_exit(
             "INDIA", symbol, px, reason="signal_sell", qty=qty
@@ -389,6 +457,9 @@ def _india_try_sell(
         alerts.trade_alert("INDIA", "SELL", symbol, f"@{px}")
         current_positions.pop(symbol, None)
         return True
+    err = str(getattr(india_broker, "last_error", "") or "")
+    if err:
+        logger.error(f"{symbol}: SELL failed — {err}")
     return False
 
 
@@ -555,7 +626,7 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                 logger.debug(f"[INDIA] early reconcile skipped: {e}")
 
             if config.INDIA_PRODUCT_TYPE.upper() in ("INTRADAY", "INTRA", "MIS"):
-                # Auto square-off from SQUAREOFF_TIME (default 15:10 IST)
+                # Auto square-off from SQUAREOFF_TIME (default 15:00 IST)
                 sq_h, sq_m = risk_mgr.squareoff_hm()
                 if risk_mgr.past_squareoff(now_ist):
                     logger.info(
@@ -565,6 +636,16 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                         sq = india_broker.square_off_intraday_positions()
                         if sq:
                             logger.info(f"[INDIA INTRADAY AUTO-SQUAREOFF] Closed: {sq}")
+                        failed = getattr(india_broker, "last_squareoff_failed", None) or []
+                        if failed:
+                            logger.critical(
+                                f"[INDIA MIS SQUAREOFF] FAILED (still open / RMS reject): "
+                                f"{failed} — do NOT assume flat"
+                            )
+                            alerts.notify(
+                                f"MIS square-off FAILED still open: {failed}",
+                                event="squareoff_fail",
+                            )
                     elif india_broker.paper is not None and hasattr(
                         india_broker.paper, "check_intraday_squareoff"
                     ):
