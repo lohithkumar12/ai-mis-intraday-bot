@@ -423,7 +423,14 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
 
             # Early positions snapshot for journal/broker sync (also refreshed later)
             try:
-                early_pos = india_broker.get_open_positions() or {}
+                early_pos = india_broker.get_open_positions()
+                if early_pos is None:
+                    logger.warning(
+                        "[INDIA] Positions fetch failed early in cycle — skipping cycle "
+                        "to avoid broker_flat reconciliation on stale data"
+                    )
+                    time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
+                    continue
                 _reconcile_india_journal(india_broker, risk_mgr, early_pos)
             except Exception as e:
                 logger.debug(f"[INDIA] early reconcile skipped: {e}")
@@ -514,7 +521,13 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
             )
 
             current_positions = india_broker.get_open_positions()
-            _reconcile_india_journal(india_broker, risk_mgr, current_positions or {})
+            if current_positions is None:
+                logger.warning(
+                    "[INDIA] Positions fetch failed — skipping cycle to avoid fake exits/duplicate buys"
+                )
+                time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
+                continue
+            _reconcile_india_journal(india_broker, risk_mgr, current_positions)
 
             bar_cache: dict = {}
             for symbol in config.INDIA_STOCK_UNIVERSE:
@@ -570,7 +583,25 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
             elapsed = time.time() - loop_start
             sleep_time = max(0, config.INDIA_LOOP_INTERVAL_SEC - elapsed)
             logger.info(f"[INDIA COMPLETE] Cycle done ({elapsed:.1f}s). Next in {sleep_time:.0f}s.\n")
-            time.sleep(sleep_time)
+
+            # Run lightweight SL/TP checks during idle wait so exits are not delayed
+            # by full scanner-cycle latency.
+            remaining = float(sleep_time)
+            risk_tick = max(1, int(getattr(config, "INDIA_RISK_CHECK_INTERVAL_SEC", 5)))
+            while remaining > 0:
+                step = min(float(risk_tick), remaining)
+                time.sleep(step)
+                remaining -= step
+                if remaining <= 0:
+                    break
+                if not is_india_market_open():
+                    continue
+                try:
+                    fast_closed = india_broker.check_sl_tp(risk_mgr)
+                    if fast_closed:
+                        logger.info(f"[INDIA FAST RISK] Closed via SL/TP: {fast_closed}")
+                except Exception as e:
+                    logger.debug(f"[INDIA FAST RISK] check skipped: {e}")
 
         except KeyboardInterrupt:
             raise
@@ -682,7 +713,14 @@ def run_india_scout_loop(strategy, risk_mgr, rs_filter=None):
             tradable_window = risk_mgr.is_tradable_session(
                 now_ist, market_open_hm=(9, 15), market_close_hm=(15, 30)
             )
-            current_positions = india_broker.get_open_positions() or {}
+            current_positions = india_broker.get_open_positions()
+            if current_positions is None:
+                logger.warning(
+                    "[INDIA SCOUT] Positions fetch failed — skipping cycle "
+                    "to avoid fake exits/duplicate buys"
+                )
+                time.sleep(interval)
+                continue
             _reconcile_india_journal(india_broker, risk_mgr, current_positions)
 
             bar_cache: dict = {}

@@ -347,6 +347,11 @@ TRADE_JOURNAL_PATH: str = os.getenv("TRADE_JOURNAL_PATH", "trade_journal.db").st
 # ===========================================================================
 
 INDIA_LOOP_INTERVAL_SEC: int = _env_int("INDIA_LOOP_INTERVAL_SEC", "45")
+# During wait/sleep between full India cycles, run lightweight SL/TP checks
+# more frequently so exits are not delayed by scanner latency.
+INDIA_RISK_CHECK_INTERVAL_SEC: int = _env_int("INDIA_RISK_CHECK_INTERVAL_SEC", "5")
+# Dashboard SSE base-position refresh cadence (live prices still stream every ~1s).
+DASH_SSE_POS_REFRESH_SEC: int = _env_int("DASH_SSE_POS_REFRESH_SEC", "8")
 
 # ===========================================================================
 # US Market — Dhan Global Stocks

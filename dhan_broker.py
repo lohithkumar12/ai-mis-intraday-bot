@@ -126,8 +126,8 @@ def _resolved_security_id(symbol: str, exchange_segment: str | None = None) -> t
 TOKEN_REFRESH_HOURS = 20
 CANDLE_CACHE_SEC = 30.0
 CANDLE_CALL_GAP_SEC = 0.35
-# Dashboard polls every few seconds — cache quotes hard to avoid 429s.
-QUOTE_CACHE_SEC = 45.0
+# Keep cache short; longer cache can delay SL/TP reactions in fast markets.
+QUOTE_CACHE_SEC = 3.0
 # After marketfeed 429/401, skip live LTP and use candles for a while.
 MARKETFEED_COOLDOWN_SEC = 90.0
 # Chunk intraday history requests (API can reject very wide ranges).
@@ -877,16 +877,17 @@ class DhanBroker:
                     )
         return None
 
-    def get_latest_quote(self, symbol: str) -> dict | None:
-        cached = self._cached_quote(symbol)
-        if cached:
-            return cached
-
+    def get_latest_quote(self, symbol: str, force_fresh: bool = False) -> dict | None:
         # Check Dhan Live Feed WebSocket cache first (Paid Data API)
         ws_feed = get_live_feed_manager()
         ws_quote = ws_feed.get_live_quote(symbol)
         if ws_quote:
             return self._cache_quote(symbol, ws_quote)
+
+        if not force_fresh:
+            cached = self._cached_quote(symbol)
+            if cached:
+                return cached
 
         # Prefer candles while marketfeed is cooling down (dashboard polls often).
         if time.time() < self._marketfeed_cooldown_until:
@@ -1403,7 +1404,7 @@ class DhanBroker:
     # -----------------------------------------------------------------------
     # Positions
     # -----------------------------------------------------------------------
-    def get_open_positions(self) -> dict:
+    def get_open_positions(self) -> dict | None:
         if self.paper is not None:
             marks = self._live_marks_for_positions(self.paper.positions.keys())
             pos_dict = self.paper.get_open_positions(marks)
@@ -1413,7 +1414,9 @@ class DhanBroker:
 
         self.ensure_session()
         if not self.dhan:
-            return {}
+            self.last_error = "Dhan positions fetch unavailable: broker session not ready"
+            logger.error(self.last_error)
+            return None
 
         pos_dict: dict = {}
         token_to_symbol = {
@@ -1423,7 +1426,15 @@ class DhanBroker:
 
         try:
             resp = self.dhan.get_positions()
-            data = self._data(resp) if self._ok(resp) else None
+            if not self._ok(resp):
+                self.last_error = f"Dhan positions API failed: {resp}"
+                logger.error(self.last_error)
+                return None
+            data = self._data(resp)
+            if data is None:
+                self.last_error = "Dhan positions API returned empty payload"
+                logger.error(self.last_error)
+                return None
             for pos in data or []:
                 if not isinstance(pos, dict):
                     continue
@@ -1488,7 +1499,9 @@ class DhanBroker:
                     "side": side,
                 }
         except Exception as e:
+            self.last_error = f"Dhan positions error: {e}"
             logger.error(f"Dhan positions error: {e}", exc_info=True)
+            return None
 
         # CNC sleeve may still show overnight holdings as exposure.
         # MIS bots must not — holdings would block new ORB entries and confuse SL/square-off.
@@ -1851,6 +1864,9 @@ class DhanBroker:
         (Truthy float so existing `if close_position(...)` checks keep working.)
         """
         positions = self.get_open_positions()
+        if positions is None:
+            logger.warning(f"{symbol}: skip close — positions snapshot unavailable")
+            return None
         if symbol not in positions:
             logger.warning(f"{symbol}: No open position to close")
             return None
@@ -1909,10 +1925,21 @@ class DhanBroker:
     def check_sl_tp(self, risk_mgr) -> list[str]:
         closed_symbols = []
         positions = self.get_open_positions()
+        if positions is None:
+            logger.warning("[INDIA SL/TP] skip — positions snapshot unavailable")
+            return closed_symbols
 
         for symbol, pos in positions.items():
             entry_price = float(pos["avg_entry_price"])
             current_price = float(pos.get("current_price") or 0)
+            # Prefer a fresh quote snapshot for risk decisions to avoid exits on stale marks.
+            try:
+                q = self.get_latest_quote(symbol, force_fresh=True)
+                ltp = float((q or {}).get("ltp") or 0)
+                if ltp > 0:
+                    current_price = ltp
+            except Exception:
+                pass
             # Missing/zero LTP must NEVER trip SL (0 <= stop would force a fake total-loss exit).
             if current_price <= 0:
                 logger.warning(
@@ -2277,6 +2304,9 @@ class DhanBroker:
             return []
         closed = []
         positions = self.get_open_positions()
+        if positions is None:
+            logger.warning("[INDIA INTRADAY] square-off skipped: positions unavailable")
+            return closed
         for symbol in list(positions.keys()):
             fill = self.close_position(symbol)
             if fill is not None:

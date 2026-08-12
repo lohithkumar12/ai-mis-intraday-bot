@@ -214,6 +214,8 @@ function clearMarketPanels() {
     document.getElementById("table-count-tag").textContent = "Loading…";
     document.getElementById("market-status").textContent = "Loading…";
     document.getElementById("last-updated").textContent = "Updating…";
+    const freshnessEl = document.getElementById("freshness-text");
+    if (freshnessEl) freshnessEl.textContent = "Freshness…";
 
     document.getElementById("positions-tbody").innerHTML =
         `<tr><td colspan="9" class="empty-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading positions…</td></tr>`;
@@ -224,6 +226,16 @@ function clearMarketPanels() {
         scoutBody.innerHTML =
             `<tr><td colspan="6" class="empty-state"><i class="fa-solid fa-spinner fa-spin"></i> Loading scout…</td></tr>`;
     }
+}
+
+function formatAge(ageSec) {
+    if (ageSec == null || Number.isNaN(Number(ageSec))) return "—";
+    const n = Math.max(0, Number(ageSec));
+    if (n < 1) return `${Math.round(n * 1000)}ms`;
+    if (n < 60) return `${n.toFixed(1)}s`;
+    const m = Math.floor(n / 60);
+    const s = Math.round(n % 60);
+    return `${m}m ${s}s`;
 }
 
 function fetchLiveData() {
@@ -416,6 +428,12 @@ function updateStatusUI(data) {
     }
 
     updateKillSwitchBadge(!!data.kill_switch_active);
+    const freshnessEl = document.getElementById("freshness-text");
+    if (freshnessEl) {
+        const brokerAge = formatAge(data.broker_positions_age_sec);
+        const quoteAge = formatAge(data.quote_age_sec);
+        freshnessEl.textContent = `Broker ${brokerAge} · Quote ${quoteAge}`;
+    }
     if (data.timestamp) {
         const parts = data.timestamp.split(' ');
         if (parts.length > 1) {
@@ -438,6 +456,8 @@ function renderDisabledState(msg) {
     marketStatusEl.textContent = "Keys Needed";
     marketBadge.style.color = "var(--warning)";
     marketBadge.style.background = "var(--warning-bg)";
+    const freshnessEl = document.getElementById("freshness-text");
+    if (freshnessEl) freshnessEl.textContent = "Broker — · Quote —";
 }
 
 function updatePositionsUI(positions, formatter, closeFnName) {
@@ -587,9 +607,10 @@ async function fetchTrades() {
             const pnl = t.pnl != null ? Number(t.pnl) : null;
             const plClass = pnl == null ? '' : (pnl >= 0 ? 'pl-positive' : 'pl-negative');
             const fmt = currentFormatter();
+            const sideLabel = (t.display_side || t.exit_side || t.side || t.status || '—');
             return `<tr>
                 <td>${t.symbol}</td>
-                <td>${t.side || t.status || '—'}</td>
+                <td>${sideLabel}</td>
                 <td>${t.qty ?? '—'}</td>
                 <td>${t.entry_price != null ? fmt(t.entry_price) : '—'}</td>
                 <td class="${plClass}">${pnl != null ? (pnl >= 0 ? '+' : '') + fmt(pnl) : '—'}</td>

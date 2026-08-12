@@ -172,7 +172,9 @@ def index():
 # SSE Live Stream — Real-time position/status push via WebSocket quote cache
 # ===========================================================================
 _sse_pos_cache: dict[str, tuple[float, dict]] = {}  # market -> (timestamp, positions_base)
-_SSE_POS_REFRESH_SEC = 30.0  # full broker API call interval for base position data
+_SSE_POS_REFRESH_SEC = max(
+    3.0, float(getattr(config, "DASH_SSE_POS_REFRESH_SEC", 8.0))
+)  # full broker API call interval for base position data
 
 
 def _get_live_feed_for_market(market: str):
@@ -267,6 +269,7 @@ def _apply_live_quotes(positions: list, feed) -> list:
         quote = feed.get_live_quote(pos["symbol"])
         if quote and quote.get("ltp") and float(quote["ltp"]) > 0:
             ltp = float(quote["ltp"])
+            q_ts = float(quote.get("timestamp") or 0)
             entry = float(pos["avg_entry_price"] or 0)
             qty = abs(int(pos["qty"] or 0))
             side = str(pos.get("side") or "BUY").upper()
@@ -280,11 +283,21 @@ def _apply_live_quotes(positions: list, feed) -> list:
                 else:
                     pos["unrealized_pl"] = (ltp - entry) * qty
                     pos["unrealized_plpc"] = round(((ltp - entry) / entry) * 100, 2)
+            pos["quote_age_sec"] = max(0.0, round(time.time() - q_ts, 2)) if q_ts > 0 else None
+        else:
+            pos["quote_age_sec"] = None
         updated.append(pos)
     return updated
 
 
-def _build_status_payload(market: str, broker, account_info: dict | None) -> dict | None:
+def _build_status_payload(
+    market: str,
+    broker,
+    account_info: dict | None,
+    *,
+    broker_positions_age_sec: float | None = None,
+    quote_age_sec: float | None = None,
+) -> dict | None:
     """Build a status payload similar to /api/status but lightweight for SSE."""
     if not account_info:
         return None
@@ -332,6 +345,8 @@ def _build_status_payload(market: str, broker, account_info: dict | None) -> dic
         "paper_trading": config.US_PAPER if market == "US" else config.INDIA_PAPER,
         "live_armed": config.US_LIVE_CONFIRMED if market == "US" else config.LIVE_CONFIRMED,
         "kill_switch_active": risk_mgr.is_kill_switch_active if risk_mgr else False,
+        "broker_positions_age_sec": broker_positions_age_sec,
+        "quote_age_sec": quote_age_sec,
     }
 
 
@@ -372,7 +387,26 @@ def _sse_generator(market: str):
             # Every 3 ticks (~3s): push status with P&L
             if tick % 3 == 0:
                 try:
-                    status = _build_status_payload(market, broker, account_info)
+                    broker_age = (now - last_pos_refresh) if last_pos_refresh > 0 else None
+                    quote_ages = [
+                        float(p.get("quote_age_sec"))
+                        for p in live_positions
+                        if p.get("quote_age_sec") is not None
+                    ]
+                    worst_quote_age = max(quote_ages) if quote_ages else None
+                    status = _build_status_payload(
+                        market,
+                        broker,
+                        account_info,
+                        broker_positions_age_sec=(
+                            round(max(0.0, broker_age), 2) if broker_age is not None else None
+                        ),
+                        quote_age_sec=(
+                            round(max(0.0, worst_quote_age), 2)
+                            if worst_quote_age is not None
+                            else None
+                        ),
+                    )
                     if status:
                         # Add live feed connection info
                         feed_connected = feed.is_connected() if feed else False
@@ -511,7 +545,7 @@ def get_india_status():
         "equity_history": _india_equity_history,
         "performance": trade_journal.performance_stats("INDIA"),
         "open_risk_pct": round(
-            india_risk.open_risk_pct(equity, india_broker.get_open_positions()),
+            india_risk.open_risk_pct(equity, india_broker.get_open_positions() or {}),
             4,
         ),
     })
@@ -526,7 +560,7 @@ def get_india_positions():
     if not india_broker or not india_broker.is_logged_in:
         return jsonify([])
 
-    positions_dict = india_broker.get_open_positions()
+    positions_dict = india_broker.get_open_positions() or {}
     positions_list = []
 
     risk_mgr = get_india_risk()
@@ -1356,7 +1390,7 @@ def get_performance():
             acct = india_broker.get_account_info()
             if acct:
                 open_risk = get_india_risk().open_risk_pct(
-                    acct["equity"], india_broker.get_open_positions()
+                    acct["equity"], india_broker.get_open_positions() or {}
                 )
 
     return jsonify({
@@ -1403,6 +1437,18 @@ def get_trades():
                         r["side"] = side
         except Exception as e:
             logger.debug(f"trade-side enrichment skipped: {e}")
+
+    # Exits are represented by closed trades. Add explicit side fields so UI can
+    # show SELL/BUY at exit time (instead of only the entry side).
+    for r in rows:
+        entry_side = str(r.get("side") or "BUY").upper()
+        status = str(r.get("status") or "").lower()
+        if entry_side not in ("BUY", "SELL"):
+            entry_side = "BUY"
+        exit_side = "BUY" if entry_side == "SELL" else "SELL"
+        r["entry_side"] = entry_side
+        r["exit_side"] = exit_side if status == "closed" else None
+        r["display_side"] = r["exit_side"] or entry_side
 
     return jsonify(rows)
 
