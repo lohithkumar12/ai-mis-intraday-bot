@@ -248,8 +248,15 @@ def _reconcile_india_journal(india_broker, risk_mgr, current_positions: dict) ->
     """Close journal rows when Dhan is already flat (broker SL / app close)."""
     try:
         def _px(sym: str) -> float:
+            # Prefer today's Dhan SELL/SL fill so broker_flat never journals @ entry.
+            try:
+                fill = float(india_broker.latest_sell_fill_price(sym) or 0)
+                if fill > 0:
+                    return fill
+            except Exception:
+                pass
             pos = (current_positions or {}).get(sym) or {}
-            mark = float(pos.get("current_price") or pos.get("avg_entry_price") or 0)
+            mark = float(pos.get("current_price") or 0)
             if mark > 0:
                 return mark
             q = india_broker.get_latest_quote(sym)
@@ -269,6 +276,21 @@ def _reconcile_india_journal(india_broker, risk_mgr, current_positions: dict) ->
                 current_positions.pop(sym, None)
         if closed:
             logger.info(f"[INDIA] Journal reconciled broker flats: {closed}")
+
+        # Fix already-closed bad rows (stale LTP / entry-as-exit) from Dhan fills.
+        try:
+            fixed = trade_journal.resync_today_exits_from_fills(
+                "INDIA",
+                india_broker.latest_sell_fill_price,
+                tz_name="Asia/Kolkata",
+            )
+            if fixed:
+                logger.warning(
+                    f"[INDIA] Journal exit fills resynced from Dhan: "
+                    f"{[r.get('symbol') for r in fixed]}"
+                )
+        except Exception as re:
+            logger.debug(f"[INDIA] journal fill resync skipped: {re}")
     except Exception as e:
         logger.debug(f"[INDIA] journal reconcile skipped: {e}")
 

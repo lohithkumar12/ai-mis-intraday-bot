@@ -1094,6 +1094,159 @@ class DhanBroker:
             logger.debug(f"fill price lookup failed for {order_id}: {e}")
         return 0.0
 
+    @staticmethod
+    def _row_fill_price(row: dict) -> float:
+        if not isinstance(row, dict):
+            return 0.0
+        for key in (
+            "averageTradedPrice",
+            "avgTradedPrice",
+            "averagePrice",
+            "avgPrice",
+            "tradedPrice",
+            "traded_price",
+            "price",
+        ):
+            raw = row.get(key)
+            if raw is None or raw == "":
+                continue
+            try:
+                px = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if px > 0:
+                return px
+        return 0.0
+
+    @staticmethod
+    def _row_event_time(row: dict) -> str:
+        if not isinstance(row, dict):
+            return ""
+        for key in (
+            "exchangeTime",
+            "updateTime",
+            "createTime",
+            "exchange_time",
+            "update_time",
+            "create_time",
+        ):
+            val = row.get(key)
+            if val:
+                return str(val)
+        return ""
+
+    def _symbol_from_order_row(self, row: dict) -> str:
+        if not isinstance(row, dict):
+            return ""
+        token_to_symbol = {
+            str(info["token"]): sym for sym, info in INDIA_INSTRUMENTS.items()
+        }
+        sec_id = str(row.get("securityId") or row.get("security_id") or "")
+        if sec_id and sec_id in token_to_symbol:
+            return token_to_symbol[sec_id]
+        trading_symbol = (
+            row.get("tradingSymbol")
+            or row.get("trading_symbol")
+            or row.get("symbol")
+            or row.get("customSymbol")
+            or ""
+        )
+        return str(trading_symbol).replace("-EQ", "").strip().upper()
+
+    def _list_order_rows(self) -> list[dict]:
+        """Today's order book rows (empty on paper / failure)."""
+        if self.paper is not None or not self.dhan:
+            return []
+        try:
+            method = getattr(self.dhan, "get_order_list", None)
+            if not callable(method):
+                return []
+            resp = method()
+            data = self._data(resp) if self._ok(resp) else None
+            if isinstance(data, list):
+                return [r for r in data if isinstance(r, dict)]
+        except Exception as e:
+            logger.debug(f"order list lookup failed: {e}")
+        return []
+
+    def _list_trade_book_rows(self) -> list[dict]:
+        """Today's trade-book rows (empty on paper / failure)."""
+        if self.paper is not None or not self.dhan:
+            return []
+        try:
+            method = getattr(self.dhan, "get_trade_book", None)
+            if not callable(method):
+                return []
+            resp = method()
+            data = self._data(resp) if self._ok(resp) else None
+            if isinstance(data, list):
+                return [r for r in data if isinstance(r, dict)]
+            if isinstance(data, dict):
+                return [data]
+        except Exception as e:
+            logger.debug(f"trade book lookup failed: {e}")
+        return []
+
+    def latest_sell_fill_price(self, symbol: str) -> float:
+        """
+        Latest today's SELL (incl. SL) fill for symbol from Dhan trade book / order list.
+
+        Prefer trade-book tradedPrice (actual executions), then order-book
+        averageTradedPrice for TRADED/PART_TRADED SELL orders. Returns 0 if unknown.
+        """
+        if self.paper is not None or not symbol:
+            return 0.0
+        self.ensure_session()
+        if not self.dhan:
+            return 0.0
+
+        want = str(symbol).upper().replace("-EQ", "").strip()
+        best_px = 0.0
+        best_ts = ""
+
+        for row in self._list_trade_book_rows():
+            side = str(
+                row.get("transactionType") or row.get("transaction_type") or ""
+            ).upper()
+            if side != "SELL":
+                continue
+            if self._symbol_from_order_row(row) != want:
+                continue
+            px = self._row_fill_price(row)
+            if px <= 0:
+                continue
+            ts = self._row_event_time(row)
+            if not best_ts or ts >= best_ts:
+                best_ts = ts or best_ts
+                best_px = px
+
+        if best_px > 0:
+            return best_px
+
+        for row in self._list_order_rows():
+            side = str(
+                row.get("transactionType") or row.get("transaction_type") or ""
+            ).upper()
+            if side != "SELL":
+                continue
+            status = str(
+                row.get("orderStatus") or row.get("order_status") or row.get("status") or ""
+            ).upper()
+            if status and status not in _FILL_STATUSES:
+                continue
+            if self._symbol_from_order_row(row) != want:
+                continue
+            # Some payloads omit filledQty but still carry averageTradedPrice.
+            px = self._row_fill_price(row)
+            if px <= 0:
+                continue
+            ts = self._row_event_time(row)
+            if not best_ts or ts >= best_ts:
+                best_ts = ts or best_ts
+                best_px = px
+
+        return best_px
+
     def resolve_exit_fill_price(
         self,
         symbol: str,
@@ -1101,11 +1254,17 @@ class DhanBroker:
         *,
         fallback: float = 0.0,
     ) -> float:
-        """Prefer broker fill, then live LTP, then caller fallback."""
+        """Prefer broker fill (order id → today's SELL history), then LTP, then fallback."""
         if order_id:
             fill = self.get_order_fill_price(order_id)
             if fill > 0:
                 return fill
+        try:
+            hist = float(self.latest_sell_fill_price(symbol) or 0)
+            if hist > 0:
+                return hist
+        except Exception as e:
+            logger.debug(f"{symbol}: sell-history fill lookup failed: {e}")
         try:
             quote = self.get_latest_quote(symbol)
             if quote and quote.get("ltp"):

@@ -37,6 +37,19 @@ def _broker_style_day_pl(
 
     Kill-switch still uses equity vs SOD in main.py — not this display figure.
     """
+    # Before summing journal realized, rewrite today's exits from Dhan SELL fills
+    # when the broker exposes that lookup (fixes stale-LTP / missing-LTP rows).
+    fill_lookup = getattr(broker, "latest_sell_fill_price", None) if broker else None
+    if market.upper() == "INDIA" and callable(fill_lookup):
+        try:
+            trade_journal.resync_today_exits_from_fills(
+                "INDIA",
+                fill_lookup,
+                tz_name="Asia/Kolkata",
+            )
+        except Exception as e:
+            logger.debug(f"{market} day P&L fill resync skipped: {e}")
+
     positions = {}
     try:
         positions = broker.get_open_positions() or {}

@@ -12,7 +12,7 @@ import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -244,7 +244,8 @@ def reconcile_broker_flats(
     """
     Journal-exit any open trade whose symbol is no longer in broker open positions
     (broker SL/TP, manual close on Dhan, etc.).
-    price_lookup(symbol) -> float exit mark (LTP / last known).
+    price_lookup(symbol) -> float exit mark (prefer broker fill, then LTP).
+    Does NOT fall back to entry (that falsely journals +0 PnL).
     """
     open_syms = {str(s).upper() for s in (broker_open_symbols or [])}
     closed: list[str] = []
@@ -252,13 +253,10 @@ def reconcile_broker_flats(
         symbol = str(row.get("symbol") or "").upper()
         if not symbol or symbol in open_syms:
             continue
-        entry = float(row.get("entry_price") or 0)
         try:
             px = float(price_lookup(symbol) or 0)
         except Exception:
             px = 0.0
-        if px <= 0:
-            px = entry
         if px <= 0:
             logger.warning(
                 f"[JOURNAL] skip broker_flat {market} {symbol}: no usable exit price"
@@ -272,6 +270,121 @@ def reconcile_broker_flats(
                 f"(reason={reason})"
             )
     return closed
+
+
+def _closed_at_local_date(raw: str, tz) -> Optional[date]:
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(tz).date()
+    except Exception:
+        return None
+
+
+def update_closed_trade_exit(
+    trade_id: int,
+    exit_price: float,
+    *,
+    reason: str | None = None,
+) -> Optional[dict]:
+    """Rewrite exit/pnl for an already-closed trade (broker-fill corrections)."""
+    px = float(exit_price or 0)
+    if px <= 0 or trade_id <= 0:
+        return None
+    with _lock, _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM trades WHERE id=? AND status='closed'",
+            (int(trade_id),),
+        ).fetchone()
+        if not row:
+            return None
+        entry = float(row["entry_price"] or 0)
+        q = int(row["qty"] or 0)
+        pnl = (px - entry) * q
+        pnl_pct = ((px - entry) / entry) if entry else 0.0
+        reason_final = reason if reason is not None else (row["reason"] or "exit")
+        conn.execute(
+            """
+            UPDATE trades SET exit_price=?, pnl=?, pnl_pct=?, reason=?
+            WHERE id=?
+            """,
+            (px, pnl, pnl_pct, reason_final, int(trade_id)),
+        )
+        result = {
+            "id": int(trade_id),
+            "market": row["market"],
+            "symbol": row["symbol"],
+            "qty": q,
+            "entry_price": entry,
+            "exit_price": px,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "reason": reason_final,
+            "prev_exit_price": float(row["exit_price"] or 0),
+            "prev_pnl": float(row["pnl"] or 0),
+        }
+    logger.warning(
+        f"[JOURNAL] CORRECTED EXIT #{result['id']} {result['market']} "
+        f"{result['symbol']} {result['prev_exit_price']:.2f}->{px:.2f} "
+        f"PnL={result['prev_pnl']:+.2f}->{pnl:+.2f}"
+    )
+    return result
+
+
+def resync_today_exits_from_fills(
+    market: str,
+    fill_lookup,
+    *,
+    tz_name: str,
+    min_abs_diff: float = 0.05,
+) -> list[dict]:
+    """
+    Rewrite today's closed exits when fill_lookup(symbol) returns a real broker fill
+    that differs from the journaled exit (fixes stale-LTP / entry-as-exit rows).
+
+    fill_lookup must return broker fills only (never LTP). Safe no-op when lookup
+    returns <= 0.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        import pytz
+
+        tz = pytz.timezone(tz_name)
+
+    today = datetime.now(tz).date()
+    with _lock, _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, symbol, exit_price, closed_at FROM trades
+            WHERE market=? AND status='closed' AND closed_at IS NOT NULL
+            """,
+            (market.upper(),),
+        ).fetchall()
+
+    corrected: list[dict] = []
+    for row in rows:
+        if _closed_at_local_date(row["closed_at"], tz) != today:
+            continue
+        symbol = str(row["symbol"] or "").upper()
+        if not symbol:
+            continue
+        try:
+            fill = float(fill_lookup(symbol) or 0)
+        except Exception:
+            fill = 0.0
+        if fill <= 0:
+            continue
+        old_exit = float(row["exit_price"] or 0)
+        if abs(fill - old_exit) < float(min_abs_diff):
+            continue
+        out = update_closed_trade_exit(int(row["id"]), fill)
+        if out:
+            corrected.append(out)
+    return corrected
 
 
 def realized_pnl_today(market: str, *, tz_name: str) -> float:
