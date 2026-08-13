@@ -176,6 +176,13 @@ class DhanBroker:
         self._session_time: datetime | None = None
         self._logged_in = False
         self.last_error = ""
+        self.last_fill_qty = 0
+        self.last_fill_price = 0.0
+        self.last_order_status = ""
+        self.last_sl_order_id = None
+        self.last_super_order_id = None
+        # symbol -> {status ACTIVE|COOLDOWN, qty, entry, stop_loss_price, target_price, order_id}
+        self.sl_tp_meta: dict[str, dict] = {}
         self._last_candle_call_time = 0.0
         self._candle_cache: dict[str, tuple[float, pd.DataFrame]] = {}
         self._quote_cache: dict[str, tuple[float, dict]] = {}
@@ -640,7 +647,12 @@ class DhanBroker:
         }
         return aliases.get(tf, 5)
 
-    def get_historical_bars(self, symbol: str, days: int = 300) -> pd.DataFrame | None:
+    def get_historical_bars(
+        self,
+        symbol: str,
+        days: int = 300,
+        interval: int | None = None,
+    ) -> pd.DataFrame | None:
         self.ensure_session()
         if not self.dhan:
             return None
@@ -653,7 +665,10 @@ class DhanBroker:
             logger.error(f"No security_id for {symbol}")
             return None
 
-        interval = self._candle_interval_minutes()
+        if interval is not None and int(interval) > 0:
+            interval = int(interval)
+        else:
+            interval = self._candle_interval_minutes()
         # Shorter TF → fewer calendar days needed for LOOKBACK_BARS
         if interval <= 5:
             days = min(days, 10)
@@ -1397,8 +1412,15 @@ class DhanBroker:
                 # PART_TRADED with zero filled qty is not a usable fill
                 if last_status == "PART_TRADED" and self.last_fill_qty <= 0:
                     order_guards.block_buy_after_pending(symbol, order_id)
+                    self._set_sl_tp_status(symbol, "COOLDOWN", order_id=order_id)
                     self.last_error = "PART_TRADED with zero filled qty"
                     return False, "PART_TRADED_ZERO_FILL"
+                try:
+                    fill_px = float(self.get_order_fill_price(order_id) or 0)
+                    if fill_px > 0:
+                        self.last_fill_price = fill_px
+                except Exception:
+                    pass
                 return True, last_status
             time.sleep(0.75)
 
@@ -1408,6 +1430,7 @@ class DhanBroker:
                 f"after {timeout:.0f}s — NOT treating as fill; cooldown on re-buy"
             )
             order_guards.block_buy_after_pending(symbol, order_id)
+            self._set_sl_tp_status(symbol, "COOLDOWN", order_id=order_id)
             self.last_error = f"pending:{last_status or 'PENDING'}"
             self.last_order_status = last_status or "PENDING"
             return False, last_status or "PENDING"
@@ -1471,6 +1494,351 @@ class DhanBroker:
         except Exception as e:
             logger.debug(f"filled qty lookup failed for {order_id}: {e}")
         return 0
+
+    def get_order_fill_snapshot(self, order_id: str) -> dict:
+        """
+        One orderbook lookup: filled_quantity, average_price, status, symbol, qty.
+        Missing fields are 0 / empty; never invents intended size.
+        """
+        empty = {
+            "order_id": str(order_id or ""),
+            "symbol": "",
+            "status": "",
+            "filled_qty": 0,
+            "average_price": 0.0,
+            "quantity": 0,
+            "remaining_qty": 0,
+        }
+        if not order_id:
+            return empty
+        if self.paper is not None:
+            empty["status"] = str(getattr(self, "last_order_status", "") or "paper")
+            empty["filled_qty"] = int(getattr(self, "last_fill_qty", 0) or 0)
+            empty["average_price"] = float(getattr(self, "last_fill_price", 0) or 0)
+            return empty
+        if not getattr(self, "dhan", None):
+            return empty
+        try:
+            if hasattr(self, "ensure_session"):
+                self.ensure_session()
+        except Exception:
+            pass
+        if not getattr(self, "dhan", None):
+            return empty
+        try:
+            method = getattr(self.dhan, "get_order_by_id", None)
+            if not callable(method):
+                return empty
+            resp = method(str(order_id))
+            if self._resp_looks_like_auth_failure(resp):
+                if self._force_relogin("get_order_by_id"):
+                    resp = method(str(order_id))
+            row = self._parse_order_payload(resp)
+            status = str(
+                row.get("orderStatus") or row.get("order_status") or row.get("status") or ""
+            ).upper()
+            qty = 0
+            try:
+                qty = int(float(row.get("quantity") or row.get("qty") or 0))
+            except (TypeError, ValueError):
+                qty = 0
+            filled = 0
+            for key in (
+                "filledQty",
+                "filled_qty",
+                "tradedQuantity",
+                "traded_quantity",
+                "quantityTraded",
+                "filled_quantity",
+            ):
+                raw = row.get(key)
+                if raw is None or raw == "":
+                    continue
+                try:
+                    filled = int(float(raw))
+                except (TypeError, ValueError):
+                    continue
+                if filled > 0:
+                    break
+            remaining = 0
+            try:
+                remaining = int(
+                    float(row.get("remainingQuantity") or row.get("remaining_quantity") or 0)
+                )
+            except (TypeError, ValueError):
+                remaining = 0
+            if filled <= 0 and qty > 0 and remaining >= 0 and qty >= remaining:
+                filled = max(0, qty - remaining)
+            if remaining <= 0 and qty > 0 and filled >= 0:
+                remaining = max(0, qty - filled)
+            return {
+                "order_id": str(order_id),
+                "symbol": self._symbol_from_order_row(row),
+                "status": status,
+                "filled_qty": int(filled),
+                "average_price": float(self._row_fill_price(row) or 0),
+                "quantity": int(qty),
+                "remaining_qty": int(remaining),
+            }
+        except Exception as e:
+            logger.debug(f"order fill snapshot failed for {order_id}: {e}")
+            return empty
+
+    def _set_sl_tp_status(
+        self,
+        symbol: str,
+        status: str,
+        *,
+        order_id: str | None = None,
+        **fields,
+    ) -> None:
+        sym = str(symbol or "").upper()
+        if not sym:
+            return
+        meta = dict((getattr(self, "sl_tp_meta", None) or {}).get(sym) or {})
+        meta["status"] = str(status or "").upper()
+        if order_id:
+            meta["order_id"] = str(order_id)
+        for k, v in fields.items():
+            if v is not None:
+                meta[k] = v
+        if not hasattr(self, "sl_tp_meta") or self.sl_tp_meta is None:
+            self.sl_tp_meta = {}
+        self.sl_tp_meta[sym] = meta
+
+    def _live_fill_qty(self, order_id: str, intended_qty: int, status: str) -> int:
+        """Broker filled qty. Never substitute intended size on PART_TRADED."""
+        filled = int(getattr(self, "last_fill_qty", 0) or 0)
+        if filled <= 0:
+            filled = int(self.get_order_filled_qty(order_id) or 0)
+        status_u = str(status or getattr(self, "last_order_status", "") or "").upper()
+        if filled <= 0 and status_u != "PART_TRADED":
+            filled = int(intended_qty or 0)
+        return int(filled)
+
+    def reconcile_partial_fill(
+        self,
+        existing_order_id: str,
+        risk_mgr=None,
+        strategy=None,
+        *,
+        intended_qty: int | None = None,
+        planned_entry: float | None = None,
+        planned_sl: float | None = None,
+        planned_tp: float | None = None,
+        atr: float | None = None,
+        source: str = "",
+        reason: str = "signal_buy",
+        symbol: str | None = None,
+        continuation: bool = False,
+    ) -> dict:
+        """
+        Sync local risk + SL/TP monitor to Dhan's actual PART_TRADED fill.
+
+        Fetches filled_quantity / average_price from the orderbook, resizes
+        RiskManager stop/target using the original plan's % distance, marks
+        sl_tp_meta ACTIVE (clears buy cooldown), and keeps day_fired True.
+        Does not overwrite an existing journal row unless the order fully cancels.
+        """
+        order_id = str(existing_order_id or "")
+        snap = self.get_order_fill_snapshot(order_id)
+        status = str(snap.get("status") or getattr(self, "last_order_status", "") or "").upper()
+        filled_qty = int(snap.get("filled_qty") or 0)
+        avg = float(snap.get("average_price") or 0)
+        sym = str(symbol or snap.get("symbol") or "").upper()
+        intended = int(intended_qty or snap.get("quantity") or 0)
+        cancelled = status in _REJECT_STATUSES
+
+        # Don't mix leftover last_fill_* into a cancelled 0-fill snapshot.
+        if not cancelled:
+            if filled_qty <= 0:
+                filled_qty = int(getattr(self, "last_fill_qty", 0) or 0)
+            if avg <= 0:
+                avg = float(getattr(self, "last_fill_price", 0) or 0)
+                if avg <= 0 and order_id:
+                    try:
+                        avg = float(self.get_order_fill_price(order_id) or 0)
+                    except Exception:
+                        avg = 0.0
+        if not sym:
+            # Fall back to risk meta keyed by order id
+            for k, meta in (getattr(risk_mgr, "_trade_meta", None) or {}).items():
+                if str(meta.get("order_id") or "") == order_id:
+                    sym = str(k).upper()
+                    break
+
+        result = {
+            "ok": False,
+            "symbol": sym,
+            "order_id": order_id,
+            "order_status": status,
+            "filled_qty": filled_qty,
+            "average_price": avg,
+            "stop_loss_price": 0.0,
+            "target_price": 0.0,
+            "monitor": "COOLDOWN",
+            "journal": "skipped",
+            "reason": "",
+        }
+
+        if cancelled and filled_qty <= 0:
+            if sym:
+                self._set_sl_tp_status(sym, "COOLDOWN", order_id=order_id)
+                if risk_mgr is not None:
+                    try:
+                        risk_mgr.clear_trade(sym)
+                    except Exception:
+                        pass
+                try:
+                    import trade_journal
+
+                    if trade_journal.void_open_entry(
+                        "INDIA", sym, reason="order_cancelled"
+                    ):
+                        result["journal"] = "voided"
+                except Exception as je:
+                    logger.debug(f"{sym}: journal void skip: {je}")
+            result["reason"] = f"order {status or 'CANCELLED'} with 0 fill"
+            result["ok"] = False
+            logger.warning(
+                f"{sym or order_id}: reconcile_partial_fill — {result['reason']}"
+            )
+            return result
+
+        if filled_qty <= 0 or avg <= 0 or not sym:
+            if sym:
+                self._set_sl_tp_status(sym, "COOLDOWN", order_id=order_id)
+                order_guards.block_buy_after_pending(sym, order_id)
+            result["reason"] = (
+                f"unusable partial fill qty={filled_qty} avg={avg} symbol={sym!r}"
+            )
+            logger.error(f"reconcile_partial_fill({order_id}): {result['reason']}")
+            return result
+
+        # Lock local state to the filled size — never the intended remainder.
+        self.last_fill_qty = filled_qty
+        self.last_fill_price = avg
+        self.last_order_status = status or "PART_TRADED"
+
+        sl = tp = 0.0
+        if risk_mgr is not None:
+            try:
+                meta = risk_mgr.apply_partial_fill(
+                    sym,
+                    filled_qty,
+                    avg,
+                    planned_entry=planned_entry,
+                    planned_sl=planned_sl,
+                    planned_tp=planned_tp,
+                    atr=atr,
+                    order_id=order_id,
+                    source=source,
+                    strategy=getattr(strategy, "name", "") if strategy is not None else None,
+                    sl_order_id=getattr(self, "last_sl_order_id", None),
+                    super_order_id=getattr(self, "last_super_order_id", None),
+                )
+                sl = float(meta.get("stop") or 0)
+                tp = float(meta.get("take_profit") or 0)
+            except Exception as e:
+                logger.error(f"{sym}: RiskManager partial-fill update failed: {e}")
+                result["reason"] = str(e)
+                return result
+        else:
+            entry_ref = float(planned_entry or avg)
+            sl_ref = float(planned_sl or 0)
+            tp_ref = float(planned_tp or 0)
+            sl_pct = (
+                (entry_ref - sl_ref) / entry_ref
+                if entry_ref > 0 and sl_ref > 0 and sl_ref < entry_ref
+                else float(getattr(config, "STOP_LOSS_PCT", 0.006) or 0.006)
+            )
+            tp_pct = (
+                (tp_ref - entry_ref) / entry_ref
+                if entry_ref > 0 and tp_ref > entry_ref
+                else float(getattr(config, "TAKE_PROFIT_PCT", 0.009) or 0.009)
+            )
+            sl = round_to_nse_tick(avg * (1.0 - sl_pct), mode="floor")
+            tp = round_to_nse_tick(avg * (1.0 + tp_pct), mode="nearest")
+
+        self._set_sl_tp_status(
+            sym,
+            "ACTIVE",
+            order_id=order_id,
+            qty=filled_qty,
+            intended_qty=intended,
+            entry=avg,
+            stop_loss_price=sl,
+            target_price=tp,
+        )
+        order_guards.clear_buy_block(sym)
+
+        if strategy is not None and hasattr(strategy, "mark_day_fired"):
+            try:
+                strategy.mark_day_fired(sym, "BUY", continuation=continuation)
+            except Exception as me:
+                logger.debug(f"{sym}: mark_day_fired skipped: {me}")
+
+        # First journal write only. Existing rows are left untouched unless cancelled above.
+        try:
+            import trade_journal
+
+            if trade_journal.has_entry_today("INDIA", sym):
+                result["journal"] = "kept"
+            else:
+                trade_journal.record_entry(
+                    "INDIA",
+                    sym,
+                    filled_qty,
+                    avg,
+                    stop_price=sl,
+                    take_profit=tp,
+                    reason=reason or "partial_fill",
+                    strategy=getattr(strategy, "name", "") if strategy is not None else "",
+                    meta={
+                        "atr": atr,
+                        "order_id": order_id,
+                        "source": source,
+                        "entry_reason": reason,
+                        "intended_qty": intended,
+                        "fill_status": status or "PART_TRADED",
+                        "partial_fill": True,
+                    },
+                )
+                result["journal"] = "recorded"
+        except Exception as je:
+            logger.debug(f"{sym}: journal skip on partial fill: {je}")
+
+        # Resize resting SL to filled qty when we have a live SL order (not Super).
+        sl_oid = getattr(self, "last_sl_order_id", None)
+        if sl_oid and sl > 0 and self.paper is None:
+            try:
+                self.sync_broker_stop(
+                    sym,
+                    sl,
+                    qty=filled_qty,
+                    sl_order_id=str(sl_oid),
+                    prev_stop=None,
+                )
+            except Exception as se:
+                logger.debug(f"{sym}: SL resize after partial fill skipped: {se}")
+
+        result.update(
+            {
+                "ok": True,
+                "symbol": sym,
+                "filled_qty": filled_qty,
+                "average_price": avg,
+                "stop_loss_price": sl,
+                "target_price": tp,
+                "monitor": "ACTIVE",
+                "reason": "partial_fill_reconciled",
+            }
+        )
+        logger.warning(
+            f"{sym}: reconcile_partial_fill ACTIVE qty={filled_qty}/{intended or '?'} "
+            f"avg={avg:.2f} SL={sl:.2f} TP={tp:.2f} journal={result['journal']}"
+        )
+        return result
 
     # -----------------------------------------------------------------------
     # Positions
@@ -1722,9 +2090,7 @@ class DhanBroker:
                         f"SUPER BUY not confirmed for {symbol} | Order ID={oid} | {status}"
                     )
                     return None
-                filled_qty = int(getattr(self, "last_fill_qty", 0) or 0)
-                if filled_qty <= 0:
-                    filled_qty = self.get_order_filled_qty(oid) or int(qty)
+                filled_qty = self._live_fill_qty(oid, qty, status)
                 if filled_qty <= 0:
                     logger.error(f"SUPER BUY {symbol}: no filled qty after {status}")
                     return None
@@ -1779,9 +2145,7 @@ class DhanBroker:
                 )
                 return None
 
-            filled_qty = int(getattr(self, "last_fill_qty", 0) or 0)
-            if filled_qty <= 0:
-                filled_qty = self.get_order_filled_qty(order_id) or int(qty)
+            filled_qty = self._live_fill_qty(order_id, qty, status)
             if filled_qty <= 0:
                 logger.error(f"BUY {symbol}: confirmed {status} but filled qty=0")
                 return None
@@ -2124,6 +2488,153 @@ class DhanBroker:
             logger.warning(f"{symbol}: broker stop sync error: {e}")
             return False
 
+    def _sl_tp_monitor_active(self, symbol: str) -> bool:
+        row = (getattr(self, "sl_tp_meta", None) or {}).get(str(symbol or "").upper()) or {}
+        if str(row.get("status") or "").upper() != "ACTIVE":
+            return False
+        try:
+            return float(row.get("stop_loss_price") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def rescue_zombie_positions(self, risk_mgr=None, strategy=None) -> list[str]:
+        """
+        Arm local SL/TP for MIS names that are live at Dhan but missing sl_tp_meta.
+
+        Does not flatten. Used after restart / PENDING fills while the bot was idle.
+        """
+        rescued: list[str] = []
+        try:
+            positions = self.get_open_positions()
+        except Exception as e:
+            logger.warning(f"[ZOMBIE] positions fetch failed: {e}")
+            return rescued
+        if not positions:
+            return rescued
+
+        sl_pct = float(getattr(config, "ZOMBIE_SL_PCT", 0) or 0)
+        if sl_pct <= 0:
+            sl_pct = float(
+                getattr(risk_mgr, "stop_loss_pct", None)
+                or getattr(config, "STOP_LOSS_PCT", 0.0045)
+                or 0.0045
+            )
+        tp_pct = float(getattr(config, "ZOMBIE_TP_PCT", 0) or 0) or 0.008
+
+        import bot_state
+
+        for symbol, pos in positions.items():
+            qty = int(pos.get("qty") or 0)
+            if qty <= 0:
+                continue
+            if self._sl_tp_monitor_active(symbol):
+                continue
+
+            ltp = 0.0
+            try:
+                q = self.get_latest_quote(symbol, force_fresh=True)
+                ltp = float((q or {}).get("ltp") or 0)
+            except Exception:
+                ltp = 0.0
+            if ltp <= 0:
+                try:
+                    ltp = float(pos.get("current_price") or 0)
+                except (TypeError, ValueError):
+                    ltp = 0.0
+            if ltp <= 0:
+                logger.warning(
+                    f"[ZOMBIE] {symbol}: open qty={qty} but no LTP — cannot arm SL/TP"
+                )
+                continue
+
+            entry = float(pos.get("avg_entry_price") or 0) or ltp
+            prev = {}
+            if risk_mgr is not None:
+                prev = dict(getattr(risk_mgr, "_trade_meta", {}).get(symbol) or {})
+            prev_sl = float(prev.get("stop") or prev.get("initial_stop") or 0)
+            prev_tp = float(prev.get("take_profit") or 0)
+
+            ltp_sl = round_to_nse_tick(ltp * (1.0 - sl_pct), mode="floor")
+            ltp_tp = round_to_nse_tick(ltp * (1.0 + tp_pct), mode="nearest")
+            # Prefer an already-planned stop if present; never leave the name naked.
+            sl = prev_sl if prev_sl > 0 else ltp_sl
+            tp = prev_tp if prev_tp > entry else ltp_tp
+            if sl >= ltp:
+                sl = ltp_sl
+            if tp <= ltp:
+                tp = ltp_tp
+            sl = max(sl, 0.01)
+
+            if risk_mgr is not None and hasattr(risk_mgr, "register_trade"):
+                try:
+                    risk_mgr.register_trade(
+                        symbol,
+                        float(prev.get("entry") or entry),
+                        sl,
+                        prev.get("atr"),
+                        qty=qty,
+                        take_profit=tp,
+                        source=prev.get("source") or "zombie_rescue",
+                        strategy=prev.get("strategy")
+                        or getattr(strategy, "name", "")
+                        or "",
+                        sl_order_id=prev.get("sl_order_id"),
+                        super_order_id=prev.get("super_order_id"),
+                        order_id=prev.get("order_id"),
+                    )
+                except Exception as re:
+                    logger.debug(f"[ZOMBIE] {symbol}: risk meta register skip: {re}")
+
+            self._set_sl_tp_status(
+                symbol,
+                "ACTIVE",
+                qty=qty,
+                entry=float(prev.get("entry") or entry),
+                stop_loss_price=sl,
+                target_price=tp,
+                source="zombie_rescue",
+            )
+
+            if strategy is not None and hasattr(strategy, "mark_day_fired"):
+                try:
+                    strategy.mark_day_fired(symbol, "BUY")
+                except Exception as me:
+                    logger.debug(f"[ZOMBIE] {symbol}: mark_day_fired skip: {me}")
+
+            try:
+                import trade_journal
+
+                if not any(
+                    str(r.get("symbol") or "").upper() == str(symbol).upper()
+                    for r in trade_journal.list_open_trades("INDIA")
+                ):
+                    trade_journal.record_entry(
+                        "INDIA",
+                        symbol,
+                        qty,
+                        float(prev.get("entry") or entry),
+                        stop_price=sl,
+                        take_profit=tp,
+                        reason="zombie_rescue",
+                        strategy=getattr(strategy, "name", "") if strategy else "",
+                        meta={
+                            "source": "zombie_rescue",
+                            "ltp": ltp,
+                            "fill_status": "ZOMBIE RESCUED",
+                        },
+                    )
+            except Exception as je:
+                logger.debug(f"[ZOMBIE] {symbol}: journal skip: {je}")
+
+            bot_state.note_zombie_rescued(symbol, ltp=ltp, sl=sl, tp=tp, qty=qty)
+            rescued.append(symbol)
+            logger.warning(
+                f"[ZOMBIE RESCUED] {symbol} qty={qty} LTP={ltp:.2f} "
+                f"SL={sl:.2f} TP={tp:.2f} — local monitor armed (not flattened)"
+            )
+
+        return rescued
+
     def check_sl_tp(self, risk_mgr) -> list[str]:
         closed_symbols = []
         positions = self.get_open_positions()
@@ -2132,6 +2643,14 @@ class DhanBroker:
             return closed_symbols
 
         for symbol, pos in positions.items():
+            sl_row = (getattr(self, "sl_tp_meta", None) or {}).get(symbol) or {}
+            monitor = str(sl_row.get("status") or "").upper()
+            if monitor in ("COOLDOWN", "PENDING"):
+                logger.info(
+                    f"[INDIA SL/TP] {symbol}: skip — monitor {monitor} "
+                    f"(waiting on reconcile_partial_fill / zombie rescue)"
+                )
+                continue
             entry_price = float(pos["avg_entry_price"])
             current_price = float(pos.get("current_price") or 0)
             # Prefer a fresh quote snapshot for risk decisions to avoid exits on stale marks.
@@ -2156,8 +2675,18 @@ class DhanBroker:
                 except (TypeError, ValueError):
                     atr = None
 
-            stored_sl = pos.get("stop_loss")
-            stored_tp = pos.get("take_profit")
+            stored_sl = sl_row.get("stop_loss_price")
+            try:
+                if stored_sl is None or float(stored_sl) <= 0:
+                    stored_sl = pos.get("stop_loss")
+            except (TypeError, ValueError):
+                stored_sl = pos.get("stop_loss")
+            stored_tp = sl_row.get("target_price")
+            try:
+                if stored_tp is None or float(stored_tp) <= 0:
+                    stored_tp = pos.get("take_profit")
+            except (TypeError, ValueError):
+                stored_tp = pos.get("take_profit")
 
             if stored_sl is not None:
                 sl_price = float(stored_sl)
@@ -2229,6 +2758,9 @@ class DhanBroker:
                         if meta:
                             meta["stop"] = sl_price
                             risk_mgr.persist_state()
+                        if sl_row:
+                            sl_row["stop_loss_price"] = sl_price
+                            sl_row["status"] = "ACTIVE"
 
                 if current_price <= sl_price:
                     reason = "stop_loss"
@@ -2251,6 +2783,15 @@ class DhanBroker:
                 if fill is not None:
                     closed_symbols.append(symbol)
                     risk_mgr.clear_trade(symbol)
+                    try:
+                        import bot_state as _bs
+
+                        _bs.clear_zombie_rescue(symbol)
+                    except Exception:
+                        pass
+                    meta_map = getattr(self, "sl_tp_meta", None)
+                    if isinstance(meta_map, dict):
+                        meta_map.pop(symbol, None)
                     try:
                         import trade_journal
 

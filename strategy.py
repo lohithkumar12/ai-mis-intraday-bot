@@ -44,9 +44,12 @@ import config
 logger = logging.getLogger(__name__)
 
 # Process-wide ORB day-fired locks (core + scout share one dict + disk file).
+# Values: {"side": "BUY", "count": 1, "first_vol": ..., "first_high": ...}
+# Legacy files may still store a plain "BUY"/"SELL" string.
 _orb_fired_lock = threading.RLock()
-_orb_fired: dict[str, str] = {}
+_orb_fired: dict[str, dict | str] = {}
 _orb_fired_loaded = False
+_orb_trigger_pending: dict[str, dict] = {}
 
 
 def reset_orb_fired_for_tests() -> None:
@@ -54,7 +57,31 @@ def reset_orb_fired_for_tests() -> None:
     global _orb_fired_loaded
     with _orb_fired_lock:
         _orb_fired.clear()
+        _orb_trigger_pending.clear()
         _orb_fired_loaded = False
+
+
+def _normalize_fired(value) -> dict | None:
+    """Coerce persisted day-fired payload to a dict. None if empty/unknown."""
+    if not value:
+        return None
+    if isinstance(value, str):
+        side = value.strip().upper()
+        if side in ("BUY", "SELL"):
+            return {"side": side, "count": 1}
+        return None
+    if isinstance(value, dict):
+        side = str(value.get("side") or "").strip().upper()
+        if side not in ("BUY", "SELL"):
+            return None
+        rec = dict(value)
+        rec["side"] = side
+        try:
+            rec["count"] = max(1, int(value.get("count") or 1))
+        except (TypeError, ValueError):
+            rec["count"] = 1
+        return rec
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +694,9 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         self.allow_short = bool(getattr(config, "ORB_ALLOW_SHORT", False))
         self.use_htf = bool(getattr(config, "ORB_USE_HTF_FILTER", True))
         self.htf_ema = int(getattr(config, "ORB_HTF_EMA_PERIOD", 20) or 20)
-        # Day-key → side only after a confirmed broker fill (not on bare signal).
+        self.last_orb_continuation = False
+        self.last_decision: dict = {}
+        # Day-key → payload only after a confirmed broker fill (not on bare signal).
         # Shared across all ORB instances via module-level _orb_fired.
         self.load_fired_state()
         logger.info(
@@ -676,11 +705,11 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         )
 
     @property
-    def _fired(self) -> dict[str, str]:
+    def _fired(self) -> dict[str, dict | str]:
         return _orb_fired
 
     @_fired.setter
-    def _fired(self, value: dict[str, str]) -> None:
+    def _fired(self, value: dict[str, dict | str]) -> None:
         global _orb_fired
         with _orb_fired_lock:
             _orb_fired = dict(value or {})
@@ -695,15 +724,40 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
                 day = datetime.now(timezone.utc).date()
         return f"{str(symbol).upper()}:{day}"
 
-    def mark_day_fired(self, symbol: str, side: str = "BUY", day=None) -> None:
-        """Lock ORB side for the session day after a confirmed fill (not on signal)."""
+    def mark_day_fired(
+        self, symbol: str, side: str = "BUY", day=None, continuation: bool = False, **kwargs
+    ) -> None:
+        """Lock ORB side for the session day after a confirmed fill (not on signal).
+
+        First fill is idempotent (count=1). Pass continuation=True on the second
+        ORB fill so count increments; journal/zombie re-marks must not bump count.
+        """
         side_u = str(side or "BUY").upper()
         if side_u not in ("BUY", "SELL"):
             return
         key = self._fire_key(symbol, day=day)
         with _orb_fired_lock:
-            _orb_fired[key] = side_u
-            logger.info(f"[ORB] marked fired {key}={side_u} (after confirmed fill)")
+            pending = _orb_trigger_pending.pop(key, None)
+            rec = _normalize_fired(_orb_fired.get(key))
+            if rec is None:
+                rec = {"side": side_u, "count": 1}
+                if pending:
+                    rec["first_vol"] = float(pending.get("vol") or 0)
+                    rec["first_high"] = float(pending.get("high") or 0)
+            elif continuation:
+                rec["count"] = int(rec.get("count") or 1) + 1
+                rec["side"] = side_u
+            else:
+                rec["side"] = side_u
+                if pending and not rec.get("first_vol"):
+                    rec["first_vol"] = float(pending.get("vol") or 0)
+                    rec["first_high"] = float(pending.get("high") or 0)
+            _orb_fired[key] = rec
+            logger.info(
+                f"[ORB] marked fired {key}={side_u} count={rec.get('count')} "
+                f"first_vol={rec.get('first_vol')} continuation={bool(continuation)} "
+                f"(after confirmed fill)"
+            )
             self._persist_fired()
 
     def has_day_fired(self, symbol: str, side: str | None = None, day=None) -> bool:
@@ -712,12 +766,55 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         self.load_fired_state()
         key = self._fire_key(symbol, day=day)
         with _orb_fired_lock:
-            got = _orb_fired.get(key)
-        if not got:
+            rec = _normalize_fired(_orb_fired.get(key))
+        if not rec:
             return False
         if side is None:
             return True
-        return got == str(side).upper()
+        return rec.get("side") == str(side).upper()
+
+    def _note_pending_trigger(self, key: str, latest) -> None:
+        """Remember the first ORB signal candle's volume until mark_day_fired."""
+        try:
+            vol = float(latest.get("volume") or 0)
+            high = float(latest.get("high") or 0)
+        except Exception:
+            return
+        with _orb_fired_lock:
+            if key in _orb_trigger_pending:
+                return
+            _orb_trigger_pending[key] = {"vol": vol, "high": high}
+
+    def _orb_continuation_ok(self, df: pd.DataFrame, fired: dict) -> tuple[bool, str]:
+        """Second ORB BUY: close ≥ prior 5m high by 0.5% AND vol > first ORB vol."""
+        if not bool(getattr(config, "ORB_CONTINUATION_ENABLED", True)):
+            return False, "orb_continuation_disabled"
+        max_n = max(1, int(getattr(config, "ORB_CONTINUATION_MAX", 2) or 2))
+        count = int(fired.get("count") or 1)
+        if count >= max_n:
+            return False, "orb_continuation_exhausted"
+        first_vol = 0.0
+        try:
+            first_vol = float(fired.get("first_vol") or 0)
+        except (TypeError, ValueError):
+            first_vol = 0.0
+        if first_vol <= 0:
+            return False, "orb_continuation_no_first_vol"
+        if df is None or len(df) < 2:
+            return False, "orb_continuation_need_2_bars"
+        prev_high = float(df["high"].iloc[-2])
+        close = float(df["close"].iloc[-1])
+        vol = float(df["volume"].iloc[-1] or 0)
+        break_pct = float(getattr(config, "ORB_CONTINUATION_BREAK_PCT", 0.005) or 0.005)
+        need = prev_high * (1.0 + break_pct)
+        if close + 1e-12 < need:
+            return False, f"orb_continuation_no_break close={close:.2f} need={need:.2f}"
+        if vol <= first_vol:
+            return False, f"orb_continuation_weak_vol {vol:.0f}<={first_vol:.0f}"
+        return True, (
+            f"orb_continuation close={close:.2f}>={need:.2f} "
+            f"vol={vol:.0f}>{first_vol:.0f}"
+        )
 
     def _fired_state_path(self) -> Path:
         journal = Path(str(getattr(config, "TRADE_JOURNAL_PATH", "trade_journal.db")))
@@ -768,10 +865,24 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             with _orb_fired_lock:
                 # Merge disk → memory (other instance may have written newer keys)
                 for k, v in raw.items():
-                    ks, vs = str(k), str(v)
+                    ks = str(k)
                     if ks.split(":")[-1] != today:
                         continue
-                    _orb_fired[ks] = vs
+                    disk_rec = _normalize_fired(v)
+                    if disk_rec is None:
+                        continue
+                    mem = _normalize_fired(_orb_fired.get(ks))
+                    if mem is None:
+                        _orb_fired[ks] = disk_rec
+                        continue
+                    merged = dict(disk_rec)
+                    if int(mem.get("count") or 1) > int(merged.get("count") or 1):
+                        merged["count"] = mem["count"]
+                        merged["side"] = mem.get("side") or merged.get("side")
+                    if not merged.get("first_vol") and mem.get("first_vol"):
+                        merged["first_vol"] = mem["first_vol"]
+                        merged["first_high"] = mem.get("first_high")
+                    _orb_fired[ks] = merged
                 # Prune stale in-memory keys
                 stale = [k for k in _orb_fired if str(k).split(":")[-1] != today]
                 for k in stale:
@@ -838,6 +949,7 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         return hi, lo
 
     def generate_signal(self, df: pd.DataFrame, symbol: str) -> str:
+        self.last_orb_continuation = False
         if config.TEST_MODE:
             return "HOLD"
         need = max(30, config.ATR_PERIOD + 5, self.htf_ema + 2)
@@ -881,12 +993,6 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             return "HOLD"
         confirm = post.iloc[-confirm_n:]
 
-        vol_avg = latest.get("VOL_AVG")
-        vol = float(latest.get("volume") or 0)
-        if vol_avg is not None and not pd.isna(vol_avg) and float(vol_avg) > 0:
-            if vol < float(vol_avg) * self.volume_mult:
-                return "HOLD"
-
         bias = None
         if self.use_htf and len(df) >= self.htf_ema:
             ema = calc_ema(df["close"], self.htf_ema)
@@ -902,10 +1008,40 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
         # Do NOT mark _fired here — only after confirmed fill via mark_day_fired().
         # Failed/rejected buys must be allowed to retry while the breakout holds.
         with _orb_fired_lock:
-            fired_side = _orb_fired.get(key)
+            fired = _normalize_fired(_orb_fired.get(key))
+        fired_side = fired.get("side") if fired else None
+
+        # After the first filled BUY, only a volume-confirmed 0.5% extension
+        # above the previous completed 5m high may unlock a second BUY.
+        if fired_side == "BUY":
+            ok, why = self._orb_continuation_ok(df, fired or {})
+            if ok:
+                self.last_orb_continuation = True
+                self.last_decision = {
+                    "symbol": symbol,
+                    "signal": "BUY",
+                    "reason": why,
+                    "orb_continuation": True,
+                    "playbook": "orb",
+                }
+                logger.info(f"[BUY SIGNAL] {symbol} — ORB continuation {why}")
+                return "BUY"
+            if config.STRICT_SELL:
+                rsi_v = float(latest.get(f"RSI_{self.p.rsi_period}", 50) or 50)
+                if float(latest["close"]) < or_high and rsi_v > self.p.rsi_sell:
+                    return "SELL"
+            return "HOLD"
+
+        vol_avg = latest.get("VOL_AVG")
+        vol = float(latest.get("volume") or 0)
+        if vol_avg is not None and not pd.isna(vol_avg) and float(vol_avg) > 0:
+            if vol < float(vol_avg) * self.volume_mult:
+                return "HOLD"
+
         if long_ok and fired_side != "BUY":
             if bias == "SELL":
                 return "HOLD"
+            self._note_pending_trigger(key, latest)
             logger.info(
                 f"[BUY SIGNAL] {symbol} — ORB long break ORH={or_high:.2f} "
                 f"confirm={confirm_n} vol_ok"
@@ -920,10 +1056,6 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
             )
             return "SELL"
 
-        # Soft exit: close back inside range after we fired long (optional)
-        if config.STRICT_SELL and fired_side == "BUY":
-            if float(latest["close"]) < or_high and float(latest.get(f"RSI_{self.p.rsi_period}", 50) or 50) > self.p.rsi_sell:
-                return "SELL"
         return "HOLD"
 
 
@@ -977,6 +1109,7 @@ class MisRegimeStrategy(BaseStrategy):
         self._trend = TrendPullbackStrategy(pullback_params)
         self._rs = RelativeStrengthFilter()
         self.last_decision: dict = {}
+        self.last_orb_continuation = False
         logger.info(
             f"[{params.market}] MisRegime | window={self.orb_window}m "
             f"confirm={self.confirm_bars} vol_mult={self.volume_mult} "
@@ -988,8 +1121,8 @@ class MisRegimeStrategy(BaseStrategy):
         """Rank INDIA_STOCK_UNIVERSE (or current bar_cache) for Playbook 1 RS."""
         self._rs.update_scores(symbol_dfs or {})
 
-    def mark_day_fired(self, symbol: str, side: str = "BUY", day=None) -> None:
-        self._orb.mark_day_fired(symbol, side=side, day=day)
+    def mark_day_fired(self, symbol: str, side: str = "BUY", day=None, **kwargs) -> None:
+        self._orb.mark_day_fired(symbol, side=side, day=day, **kwargs)
 
     def has_day_fired(self, symbol: str, side: str | None = None, day=None) -> bool:
         return bool(self._orb.has_day_fired(symbol, side=side, day=day))
@@ -1008,7 +1141,9 @@ class MisRegimeStrategy(BaseStrategy):
         reason: str,
         evaluations: list[dict],
         ts=None,
+        orb_continuation: bool = False,
     ) -> str:
+        self.last_orb_continuation = bool(orb_continuation)
         self.last_decision = {
             "symbol": symbol,
             "regime": regime,
@@ -1017,6 +1152,7 @@ class MisRegimeStrategy(BaseStrategy):
             "reason": reason,
             "evaluations": list(evaluations),
             "timestamp": str(ts) if ts is not None else None,
+            "orb_continuation": bool(orb_continuation),
         }
         eval_txt = "; ".join(
             f"{e.get('playbook')}={e.get('signal')}:{e.get('reason')}"
@@ -1128,6 +1264,8 @@ class MisRegimeStrategy(BaseStrategy):
     def _playbook_orb(self, df: pd.DataFrame, symbol: str) -> tuple[str, str]:
         sig = self._orb.generate_signal(df, symbol)
         if sig == "BUY":
+            if getattr(self._orb, "last_orb_continuation", False):
+                return "BUY", "orb_continuation"
             return "BUY", "orb_breakout"
         if sig == "SELL":
             return "HOLD", "orb_sell_ignored_long_only"
@@ -1328,6 +1466,25 @@ class MisRegimeStrategy(BaseStrategy):
         adx = float(adx_raw) if adx_raw is not None and not pd.isna(adx_raw) else 0.0
         trend_up_ok = self._trend_up_clear(close, vwap, adx, df)
 
+        # Second ORB may fire after OPEN_DRIVE if day-fired + 0.5%/volume continuation.
+        if self.has_day_fired(symbol, "BUY"):
+            orb_pair = self._playbook_orb(df, symbol)
+            if (
+                orb_pair[0] == "BUY"
+                and getattr(self._orb, "last_orb_continuation", False)
+            ):
+                eval_one(PLAYBOOK_ORB, orb_pair)
+                return self._record(
+                    symbol,
+                    regime,
+                    PLAYBOOK_ORB,
+                    "BUY",
+                    f"{regime_why}; orb_continuation",
+                    evaluations,
+                    ts=ts,
+                    orb_continuation=True,
+                )
+
         # ---- 1. OPEN_DRIVE + Improved ORB ----
         if regime == REGIME_OPEN_DRIVE:
             if eval_one(PLAYBOOK_ORB, self._playbook_orb(df, symbol)) == "BUY":
@@ -1440,11 +1597,24 @@ def snapshot_signal(strategy: BaseStrategy, df: pd.DataFrame, symbol: str) -> di
     last = getattr(strategy, "last_decision", None)
     regime = None
     playbook = None
+    orb_continuation = False
     if isinstance(last, dict) and str(last.get("symbol") or "").upper() == str(symbol).upper():
         if last.get("reason"):
             reason = str(last["reason"])
         regime = last.get("regime")
         playbook = last.get("playbook")
+        orb_continuation = bool(last.get("orb_continuation"))
+    if not orb_continuation:
+        orb_continuation = bool(getattr(strategy, "last_orb_continuation", False))
+        inner = (
+            getattr(strategy, "inner", None)
+            or getattr(strategy, "_orb", None)
+            or getattr(strategy, "_delegate", None)
+        )
+        if inner is not None:
+            orb_continuation = orb_continuation or bool(
+                getattr(inner, "last_orb_continuation", False)
+            )
     return {
         "symbol": symbol,
         "signal": signal,
@@ -1455,6 +1625,7 @@ def snapshot_signal(strategy: BaseStrategy, df: pd.DataFrame, symbol: str) -> di
         "strategy": strategy.name,
         "regime": regime,
         "playbook": playbook,
+        "orb_continuation": bool(orb_continuation),
     }
 
 
@@ -1521,14 +1692,20 @@ class FilteredStrategy(BaseStrategy):
 
     def generate_signal(self, df: pd.DataFrame, symbol: str) -> str:
         signal = self.inner.generate_signal(df, symbol)
+        if hasattr(self.inner, "last_decision") and isinstance(self.inner.last_decision, dict):
+            self.last_decision = dict(self.inner.last_decision)
+        self.last_orb_continuation = bool(
+            getattr(self.inner, "last_orb_continuation", False)
+        )
         if signal == "BUY" and self.rs is not None and not self.rs.allows(symbol):
+            self.last_orb_continuation = False
             return "HOLD"
         return signal
 
-    def mark_day_fired(self, symbol: str, side: str = "BUY", day=None) -> None:
+    def mark_day_fired(self, symbol: str, side: str = "BUY", day=None, **kwargs) -> None:
         inner = getattr(self, "inner", None)
         if inner is not None and hasattr(inner, "mark_day_fired"):
-            inner.mark_day_fired(symbol, side=side, day=day)
+            inner.mark_day_fired(symbol, side=side, day=day, **kwargs)
 
     def has_day_fired(self, symbol: str, side: str | None = None, day=None) -> bool:
         inner = getattr(self, "inner", None)
@@ -1607,14 +1784,22 @@ class Strategy(TrendPullbackStrategy):
         return self._delegate.compute_indicators(df)
 
     def generate_signal(self, df: pd.DataFrame, symbol: str) -> str:
-        return self._delegate.generate_signal(df, symbol)
+        signal = self._delegate.generate_signal(df, symbol)
+        if hasattr(self._delegate, "last_decision") and isinstance(
+            self._delegate.last_decision, dict
+        ):
+            self.last_decision = dict(self._delegate.last_decision)
+        self.last_orb_continuation = bool(
+            getattr(self._delegate, "last_orb_continuation", False)
+        )
+        return signal
 
     def latest_atr(self, df: pd.DataFrame) -> Optional[float]:
         return self._delegate.latest_atr(df)
 
-    def mark_day_fired(self, symbol: str, side: str = "BUY", day=None) -> None:
+    def mark_day_fired(self, symbol: str, side: str = "BUY", day=None, **kwargs) -> None:
         if hasattr(self._delegate, "mark_day_fired"):
-            self._delegate.mark_day_fired(symbol, side=side, day=day)
+            self._delegate.mark_day_fired(symbol, side=side, day=day, **kwargs)
 
     def has_day_fired(self, symbol: str, side: str | None = None, day=None) -> bool:
         if hasattr(self._delegate, "has_day_fired"):

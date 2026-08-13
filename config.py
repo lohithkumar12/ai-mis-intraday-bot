@@ -258,6 +258,10 @@ ORB_ALLOW_SHORT: bool = _env_bool("ORB_ALLOW_SHORT", "false")
 # Optional HTF EMA filter on ORB (uses same bars resampled / longer TF when available)
 ORB_USE_HTF_FILTER: bool = _env_bool("ORB_USE_HTF_FILTER", "true")
 ORB_HTF_EMA_PERIOD: int = _env_int("ORB_HTF_EMA_PERIOD", "20")
+# Second ORB BUY after day-fired: close >= prior 5m high × (1 + this) AND vol > first ORB vol
+ORB_CONTINUATION_ENABLED: bool = _env_bool("ORB_CONTINUATION_ENABLED", "true")
+ORB_CONTINUATION_BREAK_PCT: float = _env_float("ORB_CONTINUATION_BREAK_PCT", "0.005")
+ORB_CONTINUATION_MAX: int = _env_int("ORB_CONTINUATION_MAX", "2")
 
 # mis_regime: OPEN_DRIVE window (09:15 IST → 09:15+N). Independent of OR_MINUTES
 # (OR_MINUTES still builds the opening-range high/low for Improved ORB).
@@ -317,6 +321,9 @@ TAKE_PROFIT_R: float = _env_float("TAKE_PROFIT_R", "1.25")  # tighter than CNC s
 # Legacy pct stops kept as fallback when ATR unavailable
 STOP_LOSS_PCT: float = _env_float("STOP_LOSS_PCT", "0.006")
 TAKE_PROFIT_PCT: float = _env_float("TAKE_PROFIT_PCT", "0.009")
+# Orphan MIS rescue (broker open, no local sl_tp_meta). 0 SL → use STOP_LOSS_PCT.
+ZOMBIE_SL_PCT: float = _env_float("ZOMBIE_SL_PCT", "0.0045")
+ZOMBIE_TP_PCT: float = _env_float("ZOMBIE_TP_PCT", "0.008")
 DAILY_DRAWDOWN_LIMIT: float = _env_float("DAILY_DRAWDOWN_LIMIT", "0.02")
 # Hard stop on journal entries opened today (IST). 0 = unlimited (off).
 MAX_TRADES_PER_DAY: int = _env_int("MAX_TRADES_PER_DAY", "0")
@@ -366,6 +373,13 @@ BUY_RESERVE_TTL_SEC: float = _env_float("BUY_RESERVE_TTL_SEC", "45")
 USE_MTF_FILTER: bool = _env_bool("USE_MTF_FILTER", "false")
 USE_REGIME_FILTER: bool = _env_bool("USE_REGIME_FILTER", "false")
 REGIME_SYMBOL_INDIA: str = os.getenv("REGIME_SYMBOL_INDIA", "RELIANCE").strip().upper()
+
+# Nifty / BankNifty 5m "tide" circuit breaker — blocks new longs only (no flatten)
+TIDE_FILTER_ENABLED: bool = _env_bool("TIDE_FILTER_ENABLED", "true")
+# Lock when either index 5m close-to-close change is <= this percent
+TIDE_TRIGGER_PCT: float = _env_float("TIDE_TRIGGER_PCT", "-0.65")
+# Unlock only when BOTH indices' 5m change is > this percent
+TIDE_CLEAR_PCT: float = _env_float("TIDE_CLEAR_PCT", "-0.20")
 
 # Backtest realism
 BT_COMMISSION_PCT: float = _env_float("BT_COMMISSION_PCT", "0.001")  # 0.1% round-trip approx

@@ -23,7 +23,13 @@ from dashboard_server import start_dashboard_in_background
 import trade_journal
 import bot_state
 import alerts
-from filters import regime_allows, mtf_allows, fetch_daily_bars
+from filters import (
+    apply_tide_lock_to_signal,
+    fetch_daily_bars,
+    market_tide_filter,
+    mtf_allows,
+    regime_allows,
+)
 from strategy import snapshot_signal
 import order_guards
 
@@ -165,10 +171,16 @@ def _india_try_buy(
     if risk_mgr.is_kill_switch_active:
         logger.info(f"{symbol}: BUY skipped — kill switch active")
         return False
+    if bot_state.is_tide_bearish():
+        logger.info(f"{symbol}: BUY skipped — TIDE LOCK")
+        return False
 
-    # One entry per symbol per IST day (journal) — survives restarts / core+scout
+    continuation = bool((snap or {}).get("orb_continuation"))
+
+    # One entry per symbol per IST day (journal) — survives restarts / core+scout.
+    # ORB continuation is the only exception (volume-confirmed 0.5% extension).
     try:
-        if trade_journal.has_entry_today("INDIA", symbol):
+        if trade_journal.has_entry_today("INDIA", symbol) and not continuation:
             logger.info(
                 f"{symbol}: BUY skipped — journal already has an entry today"
             )
@@ -184,7 +196,7 @@ def _india_try_buy(
     # ORB day-fired shared lock (reload from disk)
     if hasattr(strategy, "has_day_fired"):
         try:
-            if strategy.has_day_fired(symbol, "BUY"):
+            if strategy.has_day_fired(symbol, "BUY") and not continuation:
                 logger.info(f"{symbol}: BUY skipped — ORB already fired today")
                 return False
         except Exception as e:
@@ -275,7 +287,53 @@ def _india_try_buy(
             return False
 
         # place_buy_order only returns id after TRADED/PART_TRADED confirmation.
+        fill_status = str(
+            getattr(india_broker, "last_order_status", "") or ""
+        ).upper()
         fill_qty = int(getattr(india_broker, "last_fill_qty", 0) or 0)
+        if fill_qty <= 0 and hasattr(india_broker, "get_order_filled_qty"):
+            try:
+                fill_qty = int(india_broker.get_order_filled_qty(order_id) or 0)
+            except Exception:
+                fill_qty = 0
+        # PART_TRADED: never substitute intended size — reconcile from orderbook.
+        if fill_status == "PART_TRADED" or (0 < fill_qty < int(qty)):
+            rec = india_broker.reconcile_partial_fill(
+                order_id,
+                risk_mgr=risk_mgr,
+                strategy=strategy,
+                intended_qty=qty,
+                planned_entry=limit_price,
+                planned_sl=sl,
+                planned_tp=tp,
+                atr=atr,
+                source=source,
+                reason=reason,
+                symbol=symbol,
+                continuation=continuation,
+            )
+            if not rec or not rec.get("ok"):
+                logger.warning(
+                    f"{symbol}: PART_TRADED reconcile failed — "
+                    f"{(rec or {}).get('reason') or getattr(india_broker, 'last_error', '')}"
+                )
+                return False
+            fill_qty = int(rec.get("filled_qty") or 0)
+            entry_px = float(rec.get("average_price") or 0)
+            sl = float(rec.get("stop_loss_price") or sl)
+            tp = float(rec.get("target_price") or tp)
+            alerts.trade_alert(
+                "INDIA",
+                "BUY",
+                symbol,
+                f"qty={fill_qty}/{qty} @{entry_px} PART_TRADED src={source}",
+            )
+            current_positions[symbol] = {
+                "qty": fill_qty,
+                "avg_entry_price": entry_px,
+            }
+            return True
+
         if fill_qty <= 0:
             fill_qty = int(qty)
         entry_px = float(getattr(india_broker, "last_fill_price", 0) or 0)
@@ -298,7 +356,7 @@ def _india_try_buy(
 
         if hasattr(strategy, "mark_day_fired"):
             try:
-                strategy.mark_day_fired(symbol, "BUY")
+                strategy.mark_day_fired(symbol, "BUY", continuation=continuation)
             except Exception as me:
                 logger.debug(f"{symbol}: mark_day_fired skipped: {me}")
 
@@ -315,6 +373,17 @@ def _india_try_buy(
             super_order_id=getattr(india_broker, "last_super_order_id", None),
             order_id=order_id,
         )
+        if hasattr(india_broker, "_set_sl_tp_status"):
+            india_broker._set_sl_tp_status(
+                symbol,
+                "ACTIVE",
+                order_id=order_id,
+                qty=fill_qty,
+                intended_qty=qty,
+                entry=entry_px,
+                stop_loss_price=sl,
+                target_price=tp,
+            )
         trade_journal.record_entry(
             "INDIA",
             symbol,
@@ -370,10 +439,13 @@ def _india_restore_runtime_state(india_broker, risk_mgr, strategy) -> None:
     # Also mark ORB fired for any journal entries already taken today
     try:
         if strategy is not None and hasattr(strategy, "mark_day_fired"):
+            seeded: dict[str, int] = {}
             for row in trade_journal.entries_today("INDIA"):
                 sym = str(row.get("symbol") or "")
-                if sym:
-                    strategy.mark_day_fired(sym, "BUY")
+                if not sym:
+                    continue
+                seeded[sym] = int(seeded.get(sym) or 0) + 1
+                strategy.mark_day_fired(sym, "BUY", continuation=seeded[sym] > 1)
     except Exception as e:
         logger.debug(f"ORB seed from journal: {e}")
     try:
@@ -420,6 +492,13 @@ def _india_restore_runtime_state(india_broker, risk_mgr, strategy) -> None:
         f"[INDIA] Startup reconcile done | broker_open={list(positions.keys())} "
         f"| meta={list(risk_mgr._trade_meta.keys())}"
     )
+    if hasattr(india_broker, "rescue_zombie_positions"):
+        try:
+            rescued = india_broker.rescue_zombie_positions(risk_mgr, strategy)
+            if rescued:
+                logger.warning(f"[INDIA] Startup ZOMBIE RESCUED: {rescued}")
+        except Exception as ze:
+            logger.debug(f"[INDIA] startup zombie rescue skipped: {ze}")
 
 
 def _india_try_sell(
@@ -583,6 +662,7 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
 
             if last_reset_date != now_ist.date():
                 risk_mgr.reset_kill_switch()
+                bot_state.set_tide_state(bearish=False, reason="")
                 start_of_day_equity = None
                 last_reset_date = now_ist.date()
                 if india_broker.paper is not None:
@@ -619,6 +699,14 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
             closed = india_broker.check_sl_tp(risk_mgr)
             if closed:
                 logger.info(f"[INDIA] Closed via SL/TP: {closed}")
+
+            if hasattr(india_broker, "rescue_zombie_positions"):
+                try:
+                    rescued = india_broker.rescue_zombie_positions(risk_mgr, strategy)
+                    if rescued:
+                        logger.warning(f"[INDIA] ZOMBIE RESCUED: {rescued}")
+                except Exception as ze:
+                    logger.debug(f"[INDIA] zombie rescue skipped: {ze}")
 
             # Early positions snapshot for journal/broker sync (also refreshed later)
             try:
@@ -725,6 +813,8 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                 time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
                 continue
 
+            tide_lock = market_tide_filter(india_broker)
+
             tradable_window = risk_mgr.is_tradable_session(
                 now_ist, market_open_hm=(9, 15), market_close_hm=(15, 30)
             )
@@ -765,6 +855,8 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                     continue
 
                 snap = snapshot_signal(strategy, df, symbol)
+                if tide_lock:
+                    snap = apply_tide_lock_to_signal(snap)
                 signal_rows.append(snap)
                 signal = snap["signal"]
                 atr = strategy.latest_atr(df)
@@ -815,6 +907,8 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                 if not is_india_market_open():
                     continue
                 try:
+                    if hasattr(india_broker, "rescue_zombie_positions"):
+                        india_broker.rescue_zombie_positions(risk_mgr, strategy)
                     fast_closed = india_broker.check_sl_tp(risk_mgr)
                     if fast_closed:
                         logger.info(f"[INDIA FAST RISK] Closed via SL/TP: {fast_closed}")
@@ -929,6 +1023,8 @@ def run_india_scout_loop(strategy, risk_mgr, rs_filter=None):
                 time.sleep(interval)
                 continue
 
+            tide_lock = market_tide_filter(india_broker)
+
             tradable_window = risk_mgr.is_tradable_session(
                 now_ist, market_open_hm=(9, 15), market_close_hm=(15, 30)
             )
@@ -977,6 +1073,8 @@ def run_india_scout_loop(strategy, risk_mgr, rs_filter=None):
                 if df is None or df.empty:
                     continue
                 snap = snapshot_signal(strategy, df, symbol)
+                if tide_lock:
+                    snap = apply_tide_lock_to_signal(snap)
                 signal = snap["signal"]
                 atr = strategy.latest_atr(df)
 

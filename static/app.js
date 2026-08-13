@@ -428,6 +428,9 @@ function updateStatusUI(data) {
     }
 
     updateKillSwitchBadge(!!data.kill_switch_active);
+    if (modeText && data.tide_bearish && activeMarket !== "US") {
+        modeText.textContent = `${modeText.textContent} · TIDE LOCK`;
+    }
     const freshnessEl = document.getElementById("freshness-text");
     if (freshnessEl) {
         const brokerAge = formatAge(data.broker_positions_age_sec);

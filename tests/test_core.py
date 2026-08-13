@@ -212,6 +212,12 @@ class TestIndiaScoutScoring(unittest.TestCase):
         self.assertIn("inter_symbol_fetch_gap_sec", body)
         self.assertNotIn("resolve_scout_universe", body)
         self.assertNotIn("INDIA_SCOUT_UNIVERSE", body)
+        kill_idx = body.index("if risk_mgr.is_kill_switch_active:")
+        tide_idx = body.index("market_tide_filter(")
+        pos_idx = body.index("current_positions = india_broker.get_open_positions()")
+        self.assertLess(kill_idx, tide_idx)
+        self.assertLess(tide_idx, pos_idx)
+        self.assertIn("apply_tide_lock_to_signal", body)
 
     def test_max_trades_and_loop_interval_defaults_in_source(self):
         src = Path(__file__).resolve().parents[1].joinpath("config.py").read_text(encoding="utf-8")

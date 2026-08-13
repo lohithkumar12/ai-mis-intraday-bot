@@ -542,6 +542,9 @@ def get_india_status():
         "strategy": config.STRATEGY_NAME,
         "kill_switch_active": india_risk.is_kill_switch_active,
         "kill_switch_reason": bot_state.kill_switch_reason("INDIA"),
+        "tide_bearish": bot_state.is_tide_bearish(),
+        "tide": bot_state.get_tide_state(),
+        "zombie_rescues": bot_state.list_zombie_rescues(),
         "equity_history": _india_equity_history,
         "performance": trade_journal.performance_stats("INDIA"),
         "open_risk_pct": round(
@@ -1479,6 +1482,8 @@ def get_health():
     us_risk = get_us_risk()
     h["india_kill_switch"] = bool(india_risk.is_kill_switch_active) if india_risk else False
     h["us_kill_switch"] = bool(us_risk.is_kill_switch_active) if us_risk else False
+    h["tide_bearish"] = bot_state.is_tide_bearish()
+    h["tide"] = bot_state.get_tide_state()
     h["india_enabled"] = config.INDIA_ENABLED
     h["us_enabled"] = config.US_ENABLED
     return jsonify(h)

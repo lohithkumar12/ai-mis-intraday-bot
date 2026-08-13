@@ -36,6 +36,16 @@ _us_sod: dict[str, Any] = {"date": None, "equity": None}
 # Shared kill-switch (loop + dashboard must use the same flag)
 _kill: dict[str, dict[str, Any]] = {}
 _kill_loaded = False
+# Nifty/BankNifty 5m tide latch (entries only — not persisted)
+_tide: dict[str, Any] = {
+    "bearish": False,
+    "nifty_pct": None,
+    "banknifty_pct": None,
+    "reason": "",
+    "updated_at": None,
+}
+# Broker-open / no local SL-TP (zombie) rescues — dashboard reason overlay
+_zombies: dict[str, dict[str, Any]] = {}
 
 
 def _trading_day_iso(market: str) -> str:
@@ -133,6 +143,14 @@ def publish_signals(market: str, items: list[dict]) -> None:
     key = market.upper()
     by_sym = {str(i["symbol"]): i for i in items if i.get("symbol")}
     with _lock:
+        if key == "INDIA":
+            for sym, z in _zombies.items():
+                row = dict(by_sym.get(sym) or {"symbol": sym, "signal": "HOLD", "price": 0})
+                row["reason"] = str(z.get("reason") or "ZOMBIE RESCUED")
+                row["signal"] = "HOLD"
+                if z.get("ltp"):
+                    row["price"] = z.get("ltp")
+                by_sym[sym] = row
         _signals[key] = {
             "updated_at": time.time(),
             "items": by_sym,
@@ -144,11 +162,90 @@ def get_signals(market: str, max_age_sec: float = 600.0) -> list[dict] | None:
     key = market.upper()
     with _lock:
         blob = _signals.get(key)
+        zombies = dict(_zombies) if key == "INDIA" else {}
         if not blob:
+            if not zombies:
+                return None
+            return [
+                {
+                    "symbol": sym,
+                    "signal": "HOLD",
+                    "price": z.get("ltp") or 0,
+                    "reason": str(z.get("reason") or "ZOMBIE RESCUED"),
+                }
+                for sym, z in zombies.items()
+            ]
+        if time.time() - blob["updated_at"] > max_age_sec and not zombies:
             return None
-        if time.time() - blob["updated_at"] > max_age_sec:
-            return None
-        return list(blob["list"])
+        rows = [dict(r) for r in blob["list"]]
+        have = {str(r.get("symbol") or "").upper() for r in rows}
+        for row in rows:
+            sym = str(row.get("symbol") or "").upper()
+            z = zombies.get(sym)
+            if z:
+                row["reason"] = str(z.get("reason") or "ZOMBIE RESCUED")
+                row["signal"] = "HOLD"
+        for sym, z in zombies.items():
+            if sym in have:
+                continue
+            rows.append(
+                {
+                    "symbol": sym,
+                    "signal": "HOLD",
+                    "price": z.get("ltp") or 0,
+                    "reason": str(z.get("reason") or "ZOMBIE RESCUED"),
+                }
+            )
+        return rows
+
+
+def note_zombie_rescued(
+    symbol: str,
+    *,
+    ltp: float = 0.0,
+    sl: float = 0.0,
+    tp: float = 0.0,
+    qty: int = 0,
+) -> None:
+    sym = str(symbol or "").upper()
+    if not sym:
+        return
+    with _lock:
+        _zombies[sym] = {
+            "reason": "ZOMBIE RESCUED",
+            "ltp": float(ltp or 0),
+            "sl": float(sl or 0),
+            "tp": float(tp or 0),
+            "qty": int(qty or 0),
+            "at": time.time(),
+        }
+        blob = _signals.get("INDIA")
+        if blob is None:
+            blob = {"updated_at": time.time(), "items": {}, "list": []}
+            _signals["INDIA"] = blob
+        row = dict(blob["items"].get(sym) or {"symbol": sym, "signal": "HOLD"})
+        row["reason"] = "ZOMBIE RESCUED"
+        row["signal"] = "HOLD"
+        if ltp:
+            row["price"] = float(ltp)
+        blob["items"][sym] = row
+        blob["list"] = list(blob["items"].values())
+        blob["updated_at"] = time.time()
+
+
+def list_zombie_rescues() -> list[dict[str, Any]]:
+    with _lock:
+        return [{"symbol": k, **dict(v)} for k, v in _zombies.items()]
+
+
+def clear_zombie_rescue(symbol: str) -> None:
+    with _lock:
+        _zombies.pop(str(symbol or "").upper(), None)
+
+
+def reset_zombies_for_tests() -> None:
+    with _lock:
+        _zombies.clear()
 
 
 def publish_scout(market: str, items: list[dict], *, meta: dict | None = None) -> None:
@@ -234,6 +331,40 @@ def reset_sod_for_tests() -> None:
         _india_sod["equity"] = None
         _us_sod["date"] = None
         _us_sod["equity"] = None
+
+
+def reset_tide_for_tests() -> None:
+    with _lock:
+        _tide["bearish"] = False
+        _tide["nifty_pct"] = None
+        _tide["banknifty_pct"] = None
+        _tide["reason"] = ""
+        _tide["updated_at"] = None
+
+
+def is_tide_bearish() -> bool:
+    with _lock:
+        return bool(_tide.get("bearish"))
+
+
+def get_tide_state() -> dict[str, Any]:
+    with _lock:
+        return dict(_tide)
+
+
+def set_tide_state(
+    *,
+    bearish: bool,
+    nifty_pct: float | None = None,
+    banknifty_pct: float | None = None,
+    reason: str = "",
+) -> None:
+    with _lock:
+        _tide["bearish"] = bool(bearish)
+        _tide["nifty_pct"] = nifty_pct
+        _tide["banknifty_pct"] = banknifty_pct
+        _tide["reason"] = str(reason or "")[:200]
+        _tide["updated_at"] = time.time()
 
 
 def reset_kill_for_tests() -> None:

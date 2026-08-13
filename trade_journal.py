@@ -230,6 +230,50 @@ def record_exit(
     return result
 
 
+def void_open_entry(
+    market: str,
+    symbol: str,
+    reason: str = "order_cancelled",
+) -> bool:
+    """
+    Overwrite an open journal row when the broker order fully cancels (0 fill).
+    No PnL is recorded. Partial fills must NOT call this.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with _lock, _conn() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM trades
+            WHERE market=? AND symbol=? AND status='open'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (market.upper(), symbol),
+        ).fetchone()
+        if not row:
+            return False
+        try:
+            meta = json.loads(row["meta_json"] or "{}")
+        except Exception:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["void_reason"] = reason
+        conn.execute(
+            """
+            UPDATE trades SET
+                status='cancelled', reason=?, closed_at=?,
+                pnl=0, pnl_pct=0, meta_json=?
+            WHERE id=?
+            """,
+            (reason, now, json.dumps(meta), row["id"]),
+        )
+        trade_id = int(row["id"])
+    logger.warning(
+        f"[JOURNAL] VOID #{trade_id} {market} {symbol} ({reason}) — order cancelled"
+    )
+    return True
+
+
 def snapshot_equity(market: str, equity: float):
     now = datetime.now(timezone.utc).isoformat()
     with _lock, _conn() as conn:

@@ -245,6 +245,94 @@ class RiskManager:
         self.clear_pending_risk(symbol)
         self.persist_state()
 
+    def apply_partial_fill(
+        self,
+        symbol: str,
+        filled_qty: int,
+        average_price: float,
+        *,
+        planned_entry: float | None = None,
+        planned_sl: float | None = None,
+        planned_tp: float | None = None,
+        atr: float | None = None,
+        order_id: str | None = None,
+        source: str | None = None,
+        strategy: str | None = None,
+        sl_order_id: str | None = None,
+        super_order_id: str | None = None,
+    ) -> dict:
+        """
+        Resize an open long to the broker's actual PART_TRADED fill.
+
+        Stop and target keep the same % distance as the original plan
+        (planned_sl/tp vs planned_entry, else existing meta, else config %).
+        Trailing peak resets to the fill so the trail does not use intended size/price.
+        """
+        qty = int(filled_qty or 0)
+        avg = float(average_price or 0)
+        if qty <= 0 or avg <= 0:
+            raise ValueError(
+                f"{symbol}: apply_partial_fill needs filled_qty>0 and average_price>0 "
+                f"(got qty={qty} avg={avg})"
+            )
+
+        prev = dict(self._trade_meta.get(symbol) or {})
+        entry_ref = float(
+            planned_entry
+            if planned_entry and planned_entry > 0
+            else (prev.get("entry") or 0)
+        )
+        sl_ref = float(
+            planned_sl
+            if planned_sl and planned_sl > 0
+            else (prev.get("initial_stop") or prev.get("stop") or 0)
+        )
+        tp_ref = float(
+            planned_tp
+            if planned_tp and planned_tp > 0
+            else (prev.get("take_profit") or 0)
+        )
+
+        if entry_ref > 0 and sl_ref > 0 and sl_ref < entry_ref:
+            sl_pct = (entry_ref - sl_ref) / entry_ref
+        else:
+            sl_pct = float(self.stop_loss_pct)
+        if entry_ref > 0 and tp_ref > entry_ref:
+            tp_pct = (tp_ref - entry_ref) / entry_ref
+        else:
+            tp_pct = float(self.take_profit_pct)
+
+        new_sl = _round_px(self.market, avg * (1.0 - sl_pct), mode="floor")
+        if new_sl >= avg:
+            new_sl = _round_px(self.market, avg * (1.0 - max(sl_pct, 1e-4)), mode="floor")
+        new_sl = max(new_sl, 0.01)
+        new_tp = _round_px(self.market, avg * (1.0 + tp_pct), mode="nearest")
+        if new_tp <= avg:
+            new_tp = _round_px(
+                self.market, avg * (1.0 + max(tp_pct, 1e-4)), mode="nearest"
+            )
+
+        use_atr = atr if atr is not None else prev.get("atr")
+        self.register_trade(
+            symbol,
+            avg,
+            new_sl,
+            use_atr,
+            qty=qty,
+            take_profit=new_tp,
+            source=source or prev.get("source"),
+            strategy=strategy or prev.get("strategy"),
+            sl_order_id=sl_order_id if sl_order_id is not None else prev.get("sl_order_id"),
+            super_order_id=super_order_id if super_order_id is not None else prev.get("super_order_id"),
+            order_id=order_id if order_id is not None else prev.get("order_id"),
+        )
+        logger.warning(
+            f"{symbol}: PART_TRADED risk resize qty={qty} avg={avg:.2f} "
+            f"SL={new_sl:.2f} ({sl_pct:.2%}) TP={new_tp:.2f} ({tp_pct:.2%}) "
+            f"(plan entry={entry_ref:.2f} sl={sl_ref:.2f} tp={tp_ref:.2f})"
+        )
+        return dict(self._trade_meta[symbol])
+
     def clear_trade(self, symbol: str):
         self._trade_meta.pop(symbol, None)
         self._trail_peaks.pop(symbol, None)
