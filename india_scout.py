@@ -1,8 +1,12 @@
 """
 india_scout.py — India scout universe (~Nifty 50) + Near Setups scoring
 =======================================================================
-Scout universe is TRADE-ELIGIBLE (orders placed from main India scout loop
-when INDIA_SCOUT_AUTO_BUY=true and full trend_pullback + risk gates pass).
+Scout is OPTIONAL (INDIA_SCOUT_ENABLED). The core India loop scans only
+INDIA_STOCK_UNIVERSE. For a single ~50-name universe, copy
+DEFAULT_INDIA_SCOUT_UNIVERSE into INDIA_STOCK_UNIVERSE and leave scout off.
+
+When enabled, scout names are TRADE-ELIGIBLE (orders from the scout loop
+when INDIA_SCOUT_AUTO_BUY=true and full signal + risk gates pass).
 
 This module only scores closeness for the Near Setups panel (names close
 but not confirmed). It never places orders itself.

@@ -563,7 +563,9 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
 
     logger.info(
         f"[INDIA] Ready | Mode={'PAPER SIM + live NSE data' if paper else 'LIVE REAL MONEY'} "
-        f"| Strategy={strategy.name}"
+        f"| Strategy={strategy.name} | universe={len(config.INDIA_STOCK_UNIVERSE)} "
+        f"| interval={config.INDIA_LOOP_INTERVAL_SEC}s "
+        f"| fetch_gap={float(getattr(config, 'INDIA_LOOP_FETCH_GAP_SEC', 0.4) or 0)}s"
     )
     _india_restore_runtime_state(india_broker, risk_mgr, strategy)
 
@@ -729,17 +731,24 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                 continue
             _reconcile_india_journal(india_broker, risk_mgr, current_positions)
 
+            # Core loop scans INDIA_STOCK_UNIVERSE only. Scout is a separate optional loop.
+            # 5-min ORB: 60s interval is enough for ~50 names; pause between fetches to avoid 429.
+            universe = list(config.INDIA_STOCK_UNIVERSE)
+            fetch_gap = float(getattr(config, "INDIA_LOOP_FETCH_GAP_SEC", 0.4) or 0)
             bar_cache: dict = {}
-            for symbol in config.INDIA_STOCK_UNIVERSE:
+            for i, symbol in enumerate(universe):
                 df = india_broker.get_historical_bars(symbol)
                 if df is not None and not df.empty:
                     bar_cache[symbol] = strategy.compute_indicators(df)
+                pause = config.inter_symbol_fetch_gap_sec(fetch_gap, i, len(universe))
+                if pause > 0:
+                    time.sleep(pause)
             _refresh_rs_filter(rs_filter, bar_cache)
 
             regime_ok = regime_allows("INDIA", bar_cache)
             signal_rows = []
 
-            for symbol in config.INDIA_STOCK_UNIVERSE:
+            for symbol in universe:
                 logger.info(f"[INDIA] -- Scanning {symbol} " + "-" * (40 - len(symbol)))
 
                 df = bar_cache.get(symbol)
@@ -815,10 +824,9 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
 
 def run_india_scout_loop(strategy, risk_mgr, rs_filter=None):
     """
-    Scout universe (~Nifty 50): trade-eligible on full BUY + same gates as core.
-    Also publishes Near Setups (close but not confirmed) for the dashboard.
-    Core INDIA_STOCK_UNIVERSE stays on Strategy Scanner / faster India loop.
-    Scout-only names get BUY here when INDIA_SCOUT_AUTO_BUY=true (default).
+    Optional scout loop (INDIA_SCOUT_ENABLED). Core INDIA_STOCK_UNIVERSE stays
+    on the India Strategy Scanner. Scout-only names get BUY here when
+    INDIA_SCOUT_AUTO_BUY=true. Near Setups (close but not confirmed) for the dashboard.
     """
     from india_client import get_shared_india_broker
     from india_scout import (
@@ -946,14 +954,15 @@ def run_india_scout_loop(strategy, risk_mgr, rs_filter=None):
                 except Exception as se:
                     skipped += 1
                     logger.debug(f"[INDIA SCOUT] {symbol}: {se}")
-                if i + 1 < len(universe):
-                    time.sleep(gap)
+                pause = config.inter_symbol_fetch_gap_sec(gap, i, len(universe))
+                if pause > 0:
+                    time.sleep(pause)
 
             _refresh_rs_filter(rs_filter, bar_cache)
             # Regime uses scout bars when available (RELIANCE usually present)
             regime_ok = regime_allows("INDIA", bar_cache)
 
-            # Trade scout-only names on full signal; core 12 handled by India loop
+            # Trade scout-only names on full signal; core INDIA_STOCK_UNIVERSE is handled by India loop
             for symbol in scout_trade_set:
                 df = bar_cache.get(symbol)
                 if df is None or df.empty:

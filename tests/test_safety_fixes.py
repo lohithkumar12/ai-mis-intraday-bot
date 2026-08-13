@@ -391,6 +391,15 @@ class TestCostFloorAndMaxTrades(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("max_trades", why)
 
+    def test_max_trades_per_day_zero_unlimited(self):
+        rm = RiskManager(market="INDIA")
+        with patch.object(config, "MAX_TRADES_PER_DAY", 0):
+            for i in range(12):
+                trade_journal.record_entry("INDIA", f"S{i}", 1, 10.0)
+            ok, why = rm.check_max_trades_per_day()
+            self.assertTrue(ok)
+            self.assertEqual(why, "")
+
     def test_max_daily_loss_inr(self):
         rm = RiskManager(market="INDIA")
         with patch.object(config, "MAX_DAILY_LOSS_INR", 5000):

@@ -114,6 +114,9 @@ DHAN_US_LIVE_WEBSOCKET: bool = (
     _env_bool("DHAN_US_LIVE_WEBSOCKET", "true") if DHAN_CONFIGURED else False
 )
 
+# Core India loop scans ONLY this list. Scout is optional (INDIA_SCOUT_ENABLED).
+# Single-universe (~50 names, no scout): copy india_scout.DEFAULT_INDIA_SCOUT_UNIVERSE
+# into INDIA_STOCK_UNIVERSE and set INDIA_SCOUT_ENABLED=false.
 INDIA_STOCK_UNIVERSE: list[str] = [
     s.strip().upper()
     for s in os.getenv(
@@ -123,10 +126,8 @@ INDIA_STOCK_UNIVERSE: list[str] = [
     if s.strip()
 ]
 
-# India scout universe (~Nifty 50 liquid names) — TRADE-ELIGIBLE.
-# Core INDIA_STOCK_UNIVERSE stays on Strategy Scanner (faster loop).
-# Scout auto-buys on full trend_pullback + risk/session/regime/RS gates.
-# Near-setups panel shows close-but-not-confirmed names only.
+# Optional second loop. When false, only INDIA_STOCK_UNIVERSE is scanned/traded.
+# Near-setups panel is off unless this is true. Auto-buy stays behind INDIA_SCOUT_AUTO_BUY.
 INDIA_SCOUT_ENABLED: bool = _env_bool("INDIA_SCOUT_ENABLED", "true")
 _INDIA_SCOUT_UNIVERSE_RAW = os.getenv("INDIA_SCOUT_UNIVERSE", "").strip()
 INDIA_SCOUT_UNIVERSE: list[str] = (
@@ -140,7 +141,7 @@ INDIA_SCOUT_MIN_SCORE: float = _env_float("INDIA_SCOUT_MIN_SCORE", "35")
 INDIA_SCOUT_FETCH_GAP_SEC: float = _env_float("INDIA_SCOUT_FETCH_GAP_SEC", "0.4")
 # RS gate for scout loop only (core India loop still uses RS_TOP_N). Wider list → higher N.
 INDIA_SCOUT_RS_TOP_N: int = _env_int("INDIA_SCOUT_RS_TOP_N", "10")
-# Auto-buy scout-only names on full BUY signal (default ON). Core 12 still traded by India loop.
+# Auto-buy scout-only names on full BUY signal. Core INDIA_STOCK_UNIVERSE is traded by India loop.
 INDIA_SCOUT_AUTO_BUY: bool = _env_bool("INDIA_SCOUT_AUTO_BUY", "false")
 # Deprecated alias — prefer INDIA_SCOUT_AUTO_BUY
 INDIA_SCOUT_AUTO_PROMOTE: bool = _env_bool("INDIA_SCOUT_AUTO_PROMOTE", "false")
@@ -296,8 +297,8 @@ TAKE_PROFIT_R: float = _env_float("TAKE_PROFIT_R", "1.25")  # tighter than CNC s
 STOP_LOSS_PCT: float = _env_float("STOP_LOSS_PCT", "0.006")
 TAKE_PROFIT_PCT: float = _env_float("TAKE_PROFIT_PCT", "0.009")
 DAILY_DRAWDOWN_LIMIT: float = _env_float("DAILY_DRAWDOWN_LIMIT", "0.02")
-# Hard stops (0 = disabled). Count = journal entries opened today (IST).
-MAX_TRADES_PER_DAY: int = _env_int("MAX_TRADES_PER_DAY", "8")
+# Hard stop on journal entries opened today (IST). 0 = unlimited (off).
+MAX_TRADES_PER_DAY: int = _env_int("MAX_TRADES_PER_DAY", "0")
 # Absolute ₹ loss hard stop (in addition to DAILY_DRAWDOWN_LIMIT %). 0 = off.
 MAX_DAILY_LOSS_INR: float = _env_float("MAX_DAILY_LOSS_INR", "0")
 MAX_SHARES_PER_ORDER: int = _env_int("MAX_SHARES_PER_ORDER", "500")
@@ -363,10 +364,23 @@ TRADE_JOURNAL_PATH: str = os.getenv("TRADE_JOURNAL_PATH", "trade_journal.db").st
 # Loop Intervals (bot process runs 24/7; trades only in market hours)
 # ===========================================================================
 
-INDIA_LOOP_INTERVAL_SEC: int = _env_int("INDIA_LOOP_INTERVAL_SEC", "45")
+# 5-min ORB: 60s is enough for ~50 names. A 20s loop is not required.
+INDIA_LOOP_INTERVAL_SEC: int = _env_int("INDIA_LOOP_INTERVAL_SEC", "60")
+# Pause between core-loop candle fetches so ~50 names do not HTTP 429 (0 = off).
+# Scout uses INDIA_SCOUT_FETCH_GAP_SEC the same way.
+INDIA_LOOP_FETCH_GAP_SEC: float = _env_float("INDIA_LOOP_FETCH_GAP_SEC", "0.4")
 # During wait/sleep between full India cycles, run lightweight SL/TP checks
 # more frequently so exits are not delayed by scanner latency.
 INDIA_RISK_CHECK_INTERVAL_SEC: int = _env_int("INDIA_RISK_CHECK_INTERVAL_SEC", "5")
+
+
+def inter_symbol_fetch_gap_sec(gap_sec: float, index: int, n: int) -> float:
+    """Seconds to pause after fetching symbol[index] in a list of n (0 after last)."""
+    if n <= 0 or index + 1 >= n:
+        return 0.0
+    return max(0.0, float(gap_sec or 0.0))
+
+
 # Dashboard SSE base-position refresh cadence (live prices still stream every ~1s).
 DASH_SSE_POS_REFRESH_SEC: int = _env_int("DASH_SSE_POS_REFRESH_SEC", "8")
 

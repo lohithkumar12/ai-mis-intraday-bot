@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -10,7 +12,12 @@ from risk_manager import RiskManager
 from filters import is_uptrend_df
 import bot_state
 from strategy import calc_sma, create_strategy, snapshot_signal, TrendPullbackStrategy, params_for_market
-from india_scout import rank_near_setups, resolve_scout_universe, score_near_setup
+from india_scout import (
+    DEFAULT_INDIA_SCOUT_UNIVERSE,
+    rank_near_setups,
+    resolve_scout_universe,
+    score_near_setup,
+)
 import config
 
 
@@ -180,6 +187,37 @@ class TestIndiaScoutScoring(unittest.TestCase):
         for sym in config.INDIA_STOCK_UNIVERSE:
             self.assertNotIn(sym, only)
         self.assertIn("AXISBANK", only)
+
+    def test_default_scout_universe_unique_nifty50_sized(self):
+        univ = [s.strip().upper() for s in DEFAULT_INDIA_SCOUT_UNIVERSE if str(s).strip()]
+        self.assertEqual(len(univ), len(set(univ)))
+        self.assertEqual(len(univ), 50)
+        self.assertIn("RELIANCE", univ)
+        self.assertIn("TRENT", univ)
+
+    def test_inter_symbol_fetch_gap_skips_last(self):
+        self.assertEqual(config.inter_symbol_fetch_gap_sec(0.4, 0, 50), 0.4)
+        self.assertEqual(config.inter_symbol_fetch_gap_sec(0.4, 48, 50), 0.4)
+        self.assertEqual(config.inter_symbol_fetch_gap_sec(0.4, 49, 50), 0.0)
+        self.assertEqual(config.inter_symbol_fetch_gap_sec(0, 0, 50), 0.0)
+        self.assertEqual(config.inter_symbol_fetch_gap_sec(0.4, 0, 1), 0.0)
+
+    def test_core_loop_scans_stock_universe_with_fetch_gap(self):
+        src = Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8")
+        start = src.index("def run_india_loop")
+        end = src.index("def run_india_scout_loop")
+        body = src[start:end]
+        self.assertIn("config.INDIA_STOCK_UNIVERSE", body)
+        self.assertIn("INDIA_LOOP_FETCH_GAP_SEC", body)
+        self.assertIn("inter_symbol_fetch_gap_sec", body)
+        self.assertNotIn("resolve_scout_universe", body)
+        self.assertNotIn("INDIA_SCOUT_UNIVERSE", body)
+
+    def test_max_trades_and_loop_interval_defaults_in_source(self):
+        src = Path(__file__).resolve().parents[1].joinpath("config.py").read_text(encoding="utf-8")
+        self.assertIn('MAX_TRADES_PER_DAY", "0"', src)
+        self.assertIn('INDIA_LOOP_INTERVAL_SEC", "60"', src)
+        self.assertIn("opening_range_breakout", src)
 
     def test_insufficient_bars(self):
         df = _ohlcv(np.linspace(100, 110, 20))
