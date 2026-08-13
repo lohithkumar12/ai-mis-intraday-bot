@@ -301,16 +301,25 @@ class TestOrbFireAfterFill(unittest.TestCase):
         from zoneinfo import ZoneInfo
 
         ist = ZoneInfo("Asia/Kolkata")
+        now = datetime.now(ist)
+        # Day-fired persist keeps only the IST calendar day. Use today after 10:00
+        # so 09:15–09:35 bars are completed; otherwise use yesterday.
+        today = now.date() if (now.hour * 60 + now.minute) >= 10 * 60 else (now.date() - timedelta(days=1))
+        yesterday = today - timedelta(days=1)
         # 09:15, 09:20, 09:25 = OR (high=100); then 09:30+ breakout closes at 101
         times = [
-            datetime(2026, 8, 12, 9, 15, tzinfo=ist),
-            datetime(2026, 8, 12, 9, 20, tzinfo=ist),
-            datetime(2026, 8, 12, 9, 25, tzinfo=ist),
-            datetime(2026, 8, 12, 9, 30, tzinfo=ist),
-            datetime(2026, 8, 12, 9, 35, tzinfo=ist),
+            datetime(today.year, today.month, today.day, 9, 15, tzinfo=ist),
+            datetime(today.year, today.month, today.day, 9, 20, tzinfo=ist),
+            datetime(today.year, today.month, today.day, 9, 25, tzinfo=ist),
+            datetime(today.year, today.month, today.day, 9, 30, tzinfo=ist),
+            datetime(today.year, today.month, today.day, 9, 35, tzinfo=ist),
         ]
         # Need enough history for ATR/EMA — prepend flat bars
-        pre = [datetime(2026, 8, 11, 12, 0, tzinfo=ist) + timedelta(minutes=5 * i) for i in range(40)]
+        pre = [
+            datetime(yesterday.year, yesterday.month, yesterday.day, 12, 0, tzinfo=ist)
+            + timedelta(minutes=5 * i)
+            for i in range(40)
+        ]
         idx = pre + times
         n = len(idx)
         close = [99.0] * 40 + [99.0, 99.5, 100.0, 101.0, 101.5]

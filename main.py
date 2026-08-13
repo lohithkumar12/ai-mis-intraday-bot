@@ -119,6 +119,13 @@ def _refresh_rs_filter(rs_filter, symbol_dfs: dict):
         rs_filter.update_scores(symbol_dfs)
 
 
+def _refresh_strategy_universe(strategy, symbol_dfs: dict):
+    """Push the cycle bar_cache into mis_regime Playbook 1 RS ranking. No extra order path."""
+    updater = getattr(strategy, "update_universe", None)
+    if callable(updater):
+        updater(symbol_dfs)
+
+
 def _india_mis_day_pl(india_broker, equity: float) -> float:
     """Journal-style day P&L for MIS kill-switch (not raw Dhan equity delta)."""
     from dashboard_server import _broker_style_day_pl
@@ -744,6 +751,7 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                 if pause > 0:
                     time.sleep(pause)
             _refresh_rs_filter(rs_filter, bar_cache)
+            _refresh_strategy_universe(strategy, bar_cache)
 
             regime_ok = regime_allows("INDIA", bar_cache)
             signal_rows = []
@@ -959,6 +967,7 @@ def run_india_scout_loop(strategy, risk_mgr, rs_filter=None):
                     time.sleep(pause)
 
             _refresh_rs_filter(rs_filter, bar_cache)
+            _refresh_strategy_universe(strategy, bar_cache)
             # Regime uses scout bars when available (RELIANCE usually present)
             regime_ok = regime_allows("INDIA", bar_cache)
 
@@ -1287,7 +1296,9 @@ def run_bot():
     )
     logger.info(
         f"   Strategy={config.STRATEGY_NAME} | TF={config.TIMEFRAME} | "
-        f"OR={getattr(config,'OR_MINUTES',15)}m | cutoff={config.ENTRY_CUTOFF} | "
+        f"OR={getattr(config,'OR_MINUTES',15)}m | "
+        f"ORB_window={getattr(config,'ORB_WINDOW_MINUTES',60)}m | "
+        f"cutoff={config.ENTRY_CUTOFF} | "
         f"squareoff={config.SQUAREOFF_TIME} | capital_cap={getattr(config,'INDIA_CAPITAL_CAP',0):,.0f}"
     )
     logger.info(

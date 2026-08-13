@@ -232,15 +232,17 @@ CURRENCY_UNIVERSE: list[str] = [
 CURRENCY_CAPITAL_CAP: float = _env_float("CURRENCY_CAPITAL_CAP", "100000.0")
 
 # ===========================================================================
-# Strategy Selection (MIS primary = opening_range_breakout)
-#   opening_range_breakout / orb — first N-min range break + volume (MIS default)
+# Strategy Selection (MIS primary = mis_regime)
+#   mis_regime / regime_mis / vwap_regime — regime XOR selector (India default)
+#   opening_range_breakout / orb — first N-min range break + volume (legacy)
 #   trend_pullback   — CNC-style pullback (available but not default here)
 #   mean_reversion   — BB+RSI only in ranging markets (low ADX)
 #   regime_adaptive  — ADX switches between trend_pullback and mean_reversion
 #   breakout         — Donchian-style high breakout with volume
-#   + USE_RELATIVE_STRENGTH — optional RS top-N gate on BUY
+#   + USE_RELATIVE_STRENGTH — optional RS top-N gate on BUY (legacy strategies)
+#     Playbook 1 (VWAP momentum) always applies its own RS ranking.
 # ===========================================================================
-STRATEGY_NAME: str = os.getenv("STRATEGY_NAME", "opening_range_breakout").strip().lower()
+STRATEGY_NAME: str = os.getenv("STRATEGY_NAME", "mis_regime").strip().lower()
 USE_RELATIVE_STRENGTH: bool = _env_bool("USE_RELATIVE_STRENGTH", "false")
 RS_TOP_N: int = _env_int("RS_TOP_N", "5")
 RS_LOOKBACK_BARS: int = _env_int("RS_LOOKBACK_BARS", "60")
@@ -249,13 +251,32 @@ RS_LOOKBACK_BARS: int = _env_int("RS_LOOKBACK_BARS", "60")
 TIMEFRAME: str = os.getenv("TIMEFRAME", "5")
 LOOKBACK_BARS: int = _env_int("LOOKBACK_BARS", "120")
 
-# ORB knobs (used when STRATEGY_NAME=opening_range_breakout)
+# ORB knobs (legacy opening_range_breakout — do not change these defaults for mis_regime)
 OR_MINUTES: int = _env_int("OR_MINUTES", "15")
 VOLUME_MULT: float = _env_float("VOLUME_MULT", "0.8")
 ORB_ALLOW_SHORT: bool = _env_bool("ORB_ALLOW_SHORT", "false")
 # Optional HTF EMA filter on ORB (uses same bars resampled / longer TF when available)
 ORB_USE_HTF_FILTER: bool = _env_bool("ORB_USE_HTF_FILTER", "true")
 ORB_HTF_EMA_PERIOD: int = _env_int("ORB_HTF_EMA_PERIOD", "20")
+
+# mis_regime: OPEN_DRIVE window (09:15 IST → 09:15+N). Independent of OR_MINUTES
+# (OR_MINUTES still builds the opening-range high/low for Improved ORB).
+ORB_WINDOW_MINUTES: int = _env_int("ORB_WINDOW_MINUTES", "60")
+ADX_RISING_LOOKBACK: int = _env_int("ADX_RISING_LOOKBACK", "2")
+RANGE_EXPANSION_MULT: float = _env_float("RANGE_EXPANSION_MULT", "1.2")
+# Stricter ORB/volume defaults for mis_regime only (legacy ORB keeps CONFIRM_BARS/VOLUME_MULT)
+MIS_REGIME_CONFIRM_BARS: int = _env_int("MIS_REGIME_CONFIRM_BARS", "2")
+MIS_REGIME_VOLUME_MULT: float = _env_float("MIS_REGIME_VOLUME_MULT", "1.2")
+# Playbook 1 momentum: close > prior N-bar high
+MOMENTUM_LOOKBACK_BARS: int = _env_int("MOMENTUM_LOOKBACK_BARS", "20")
+# Playbook 2: HOLD if close > VWAP/EMA by this many ATRs (extended, wait for pullback)
+EMA_EXTENSION_ATR: float = _env_float("EMA_EXTENSION_ATR", "1.0")
+# Playbook 4 VWAP mean reversion (RANGE only)
+VWAP_STRETCH_ATR: float = _env_float("VWAP_STRETCH_ATR", "1.0")
+RSI_OVERSOLD: float = _env_float("RSI_OVERSOLD", "30")
+VWAP_RECLAIM_BARS: int = _env_int("VWAP_RECLAIM_BARS", "1")
+# mis_regime-only: block a new BUY after a same-day losing exit (0 = off)
+LOSS_REENTRY_COOLDOWN_MIN: int = _env_int("LOSS_REENTRY_COOLDOWN_MIN", "30")
 
 # Shared indicator defaults (overridden per-market below)
 SMA_SLOW: int = _env_int("SMA_SLOW", "200")
