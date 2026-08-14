@@ -20,11 +20,12 @@ Env (see config.py):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -181,8 +182,12 @@ class DhanBroker:
         self.last_order_status = ""
         self.last_sl_order_id = None
         self.last_super_order_id = None
-        # symbol -> {status ACTIVE|COOLDOWN, qty, entry, stop_loss_price, target_price, order_id}
+        # symbol -> {status ACTIVE|COOLDOWN, active, sl, tp, qty, entry, order_id, ...}
         self.sl_tp_meta: dict[str, dict] = {}
+        self._squareoff_done_today = False
+        self._zombie_rescue_time: dict[str, float] = {}
+        self._session_reset_day: str | None = None
+        self.load_sl_tp_meta()
         self._last_candle_call_time = 0.0
         self._candle_cache: dict[str, tuple[float, pd.DataFrame]] = {}
         self._quote_cache: dict[str, tuple[float, dict]] = {}
@@ -1590,21 +1595,118 @@ class DhanBroker:
         status: str,
         *,
         order_id: str | None = None,
+        persist: bool = True,
         **fields,
     ) -> None:
         sym = str(symbol or "").upper()
         if not sym:
             return
         meta = dict((getattr(self, "sl_tp_meta", None) or {}).get(sym) or {})
-        meta["status"] = str(status or "").upper()
+        status_u = str(status or "").upper()
+        meta["status"] = status_u
+        meta["active"] = status_u == "ACTIVE"
         if order_id:
             meta["order_id"] = str(order_id)
         for k, v in fields.items():
             if v is not None:
                 meta[k] = v
+        if meta.get("stop_loss_price") is not None and meta.get("sl") is None:
+            meta["sl"] = meta.get("stop_loss_price")
+        if meta.get("target_price") is not None and meta.get("tp") is None:
+            meta["tp"] = meta.get("target_price")
+        if meta.get("sl") is not None and not meta.get("stop_loss_price"):
+            meta["stop_loss_price"] = meta["sl"]
+        if meta.get("tp") is not None and not meta.get("target_price"):
+            meta["target_price"] = meta["tp"]
         if not hasattr(self, "sl_tp_meta") or self.sl_tp_meta is None:
             self.sl_tp_meta = {}
         self.sl_tp_meta[sym] = meta
+        if persist:
+            self.save_sl_tp_meta()
+
+    def _sl_tp_state_path(self) -> Path:
+        journal = Path(str(getattr(config, "TRADE_JOURNAL_PATH", "trade_journal.db")))
+        return journal.expanduser().resolve().parent / "sl_tp_meta.json"
+
+    def save_sl_tp_meta(self) -> None:
+        """Persist sl_tp_meta so SL/TP survive process restarts."""
+        try:
+            path = self._sl_tp_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = dict(getattr(self, "sl_tp_meta", None) or {})
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
+            tmp.replace(path)
+        except Exception as e:
+            logger.debug(f"sl_tp_meta persist skip: {e}")
+
+    def load_sl_tp_meta(self) -> None:
+        """Restore SL/TP monitors from sl_tp_meta.json at startup."""
+        try:
+            path = self._sl_tp_state_path()
+            if not path.is_file():
+                return
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return
+            restored: dict[str, dict] = {}
+            for k, v in raw.items():
+                if not isinstance(v, dict):
+                    continue
+                rec = dict(v)
+                status = str(rec.get("status") or "").upper()
+                if rec.get("active") is True or status == "ACTIVE":
+                    rec["status"] = "ACTIVE"
+                    rec["active"] = True
+                else:
+                    rec["active"] = bool(rec.get("active"))
+                if rec.get("sl") is not None and not rec.get("stop_loss_price"):
+                    rec["stop_loss_price"] = rec["sl"]
+                if rec.get("tp") is not None and not rec.get("target_price"):
+                    rec["target_price"] = rec["tp"]
+                restored[str(k).upper()] = rec
+            self.sl_tp_meta = restored
+            if restored:
+                logger.info(f"[SL/TP] restored {len(restored)} monitors from {path.name}")
+        except Exception as e:
+            logger.debug(f"sl_tp_meta load skip: {e}")
+
+    def register_sl_tp(self, symbol: str, sl: float, tp: float, **fields) -> None:
+        """Mark a fill as locally monitored and persist."""
+        self._set_sl_tp_status(
+            symbol,
+            "ACTIVE",
+            sl=sl,
+            tp=tp,
+            stop_loss_price=sl,
+            target_price=tp,
+            active=True,
+            **fields,
+        )
+        logger.info(f"[SL/TP REGISTERED] {str(symbol).upper()}")
+
+    def reset_session_state(self) -> None:
+        self._squareoff_done_today = False
+        self._zombie_rescue_time = {}
+        logger.info("[SESSION RESET] State cleared")
+
+    def maybe_session_reset(self, now: datetime | None = None) -> None:
+        """Clear daily square-off / zombie throttle flags at 09:15 IST."""
+        if now is None:
+            try:
+                from zoneinfo import ZoneInfo
+
+                now = datetime.now(ZoneInfo("Asia/Kolkata"))
+            except Exception:
+                now = datetime.now(timezone.utc)
+        mins = int(now.hour) * 60 + int(now.minute)
+        if mins < 9 * 60 + 15:
+            return
+        day = str(now.date())
+        if getattr(self, "_session_reset_day", None) == day:
+            return
+        self.reset_session_state()
+        self._session_reset_day = day
 
     def _live_fill_qty(self, order_id: str, intended_qty: int, status: str) -> int:
         """Broker filled qty. Never substitute intended size on PART_TRADED."""
@@ -1760,15 +1862,14 @@ class DhanBroker:
             sl = round_to_nse_tick(avg * (1.0 - sl_pct), mode="floor")
             tp = round_to_nse_tick(avg * (1.0 + tp_pct), mode="nearest")
 
-        self._set_sl_tp_status(
+        self.register_sl_tp(
             sym,
-            "ACTIVE",
+            sl,
+            tp,
             order_id=order_id,
             qty=filled_qty,
             intended_qty=intended,
             entry=avg,
-            stop_loss_price=sl,
-            target_price=tp,
         )
         order_guards.clear_buy_block(sym)
 
@@ -2016,6 +2117,8 @@ class DhanBroker:
         take_profit_price: float | None = None,
         atr: float | None = None,
         product_type: str | None = None,
+        available_cash: float | None = None,
+        margin_used: float | None = None,
     ) -> str | None:
         if not self._assert_live_allowed(f"BUY {symbol}"):
             return None
@@ -2043,6 +2146,21 @@ class DhanBroker:
         p_type = (product_type or config.INDIA_PRODUCT_TYPE or "CNC").strip().upper()
         dhan_ptype = _dhan_product_type(p_type)
         margin_req = self.get_margin_required(symbol, qty, limit_price, p_type)
+        if margin_req <= 0:
+            margin_req = (float(qty) * float(limit_price)) / 5.0 if p_type in (
+                "INTRADAY",
+                "INTRA",
+                "MIS",
+            ) else float(qty) * float(limit_price)
+        if available_cash is not None:
+            used = float(margin_used or 0)
+            free = float(available_cash) - used
+            if margin_req > free:
+                logger.info(
+                    f"[MARGIN REJECTED] {symbol}: needs {margin_req}, free {free}"
+                )
+                self.last_error = f"margin_rejected needs={margin_req} free={free}"
+                return None
 
         if self.paper is not None:
             quote = self.get_latest_quote(symbol)
@@ -2063,6 +2181,14 @@ class DhanBroker:
             self.last_order_status = "paper"
             self.last_sl_order_id = None
             self.last_super_order_id = None
+            if stop_loss_price and take_profit_price:
+                self.register_sl_tp(
+                    symbol,
+                    float(stop_loss_price),
+                    float(take_profit_price),
+                    qty=int(qty),
+                    entry=float(fill),
+                )
             return oid
 
         self.ensure_session()
@@ -2111,6 +2237,15 @@ class DhanBroker:
                     symbol, oid, fallback=float(limit_price)
                 )
                 self.last_fill_price = fill
+                if stop_loss_price and take_profit_price:
+                    self.register_sl_tp(
+                        symbol,
+                        float(stop_loss_price),
+                        float(take_profit_price),
+                        order_id=str(oid),
+                        qty=filled_qty,
+                        entry=fill,
+                    )
                 logger.warning(
                     f"LIVE SUPER BUY (Dhan) | {symbol} | Qty={filled_qty}/{qty} | "
                     f"Order ID={oid} | Status={status} | Fill={fill:.2f}"
@@ -2155,6 +2290,15 @@ class DhanBroker:
                 symbol, order_id, fallback=float(limit_price)
             )
             self.last_fill_price = fill
+            if stop_loss_price and take_profit_price:
+                self.register_sl_tp(
+                    symbol,
+                    float(stop_loss_price),
+                    float(take_profit_price),
+                    order_id=str(order_id),
+                    qty=filled_qty,
+                    entry=fill,
+                )
             logger.warning(
                 f"LIVE BUY ORDER (Dhan) | {symbol} | Product={p_type} ({dhan_ptype}) | "
                 f"Qty={filled_qty}/{qty} | "
@@ -2490,10 +2634,15 @@ class DhanBroker:
 
     def _sl_tp_monitor_active(self, symbol: str) -> bool:
         row = (getattr(self, "sl_tp_meta", None) or {}).get(str(symbol or "").upper()) or {}
+        if row.get("active") is True:
+            try:
+                return float(row.get("stop_loss_price") or row.get("sl") or 0) > 0
+            except (TypeError, ValueError):
+                return False
         if str(row.get("status") or "").upper() != "ACTIVE":
             return False
         try:
-            return float(row.get("stop_loss_price") or 0) > 0
+            return float(row.get("stop_loss_price") or row.get("sl") or 0) > 0
         except (TypeError, ValueError):
             return False
 
@@ -2523,11 +2672,20 @@ class DhanBroker:
 
         import bot_state
 
+        if not hasattr(self, "_zombie_rescue_time") or self._zombie_rescue_time is None:
+            self._zombie_rescue_time = {}
+
         for symbol, pos in positions.items():
             qty = int(pos.get("qty") or 0)
             if qty <= 0:
                 continue
-            if self._sl_tp_monitor_active(symbol):
+            row = (getattr(self, "sl_tp_meta", None) or {}).get(str(symbol).upper()) or {}
+            if row.get("active") is True or self._sl_tp_monitor_active(symbol):
+                logger.info(f"[ZOMBIE SKIP] {symbol} already monitored")
+                continue
+            last = self._zombie_rescue_time.get(str(symbol).upper())
+            if last and (time.time() - float(last)) < 300:
+                logger.info(f"[ZOMBIE SKIP] {symbol} rescued recently - throttling")
                 continue
 
             ltp = 0.0
@@ -2592,8 +2750,12 @@ class DhanBroker:
                 entry=float(prev.get("entry") or entry),
                 stop_loss_price=sl,
                 target_price=tp,
+                sl=sl,
+                tp=tp,
+                active=True,
                 source="zombie_rescue",
             )
+            self._zombie_rescue_time[str(symbol).upper()] = time.time()
 
             if strategy is not None and hasattr(strategy, "mark_day_fired"):
                 try:
@@ -2628,10 +2790,7 @@ class DhanBroker:
 
             bot_state.note_zombie_rescued(symbol, ltp=ltp, sl=sl, tp=tp, qty=qty)
             rescued.append(symbol)
-            logger.warning(
-                f"[ZOMBIE RESCUED] {symbol} qty={qty} LTP={ltp:.2f} "
-                f"SL={sl:.2f} TP={tp:.2f} — local monitor armed (not flattened)"
-            )
+            logger.warning(f"[ZOMBIE RESCUED] {symbol} SL={sl} TP={tp}")
 
         return rescued
 
@@ -2784,6 +2943,10 @@ class DhanBroker:
                     closed_symbols.append(symbol)
                     risk_mgr.clear_trade(symbol)
                     try:
+                        risk_mgr.release_margin(symbol)
+                    except Exception:
+                        pass
+                    try:
                         import bot_state as _bs
 
                         _bs.clear_zombie_rescue(symbol)
@@ -2792,6 +2955,7 @@ class DhanBroker:
                     meta_map = getattr(self, "sl_tp_meta", None)
                     if isinstance(meta_map, dict):
                         meta_map.pop(symbol, None)
+                        self.save_sl_tp_meta()
                     try:
                         import trade_journal
 
@@ -3046,7 +3210,11 @@ class DhanBroker:
                     if self._ok(resp):
                         data = self._data(resp)
                         if isinstance(data, dict):
-                            margin = data.get("totalMargin") or data.get("margin_required") or data.get("leverage")
+                            margin = (
+                                data.get("totalMargin")
+                                or data.get("margin_required")
+                                or data.get("total_margin")
+                            )
                             if margin and float(margin) > 0:
                                 return float(margin)
             except Exception as e:
@@ -3080,6 +3248,9 @@ class DhanBroker:
             or "TOO MANY REQUESTS" in msg
         )
 
+    def square_off_all_positions(self) -> list[str]:
+        return self.square_off_intraday_positions()
+
     def square_off_intraday_positions(self) -> list[str]:
         """
         Auto square-off for INTRADAY product before broker cutoff (~15:15 IST).
@@ -3090,6 +3261,9 @@ class DhanBroker:
         self.last_squareoff_failed = []
         if (config.INDIA_PRODUCT_TYPE or "CNC").upper() not in ("INTRADAY", "INTRA", "MIS"):
             return []
+        if getattr(self, "_squareoff_done_today", False):
+            return []
+
         closed = []
         failed: list[str] = []
         gap = float(getattr(config, "FLATTEN_API_GAP_SEC", 1.5) or 0)
@@ -3107,6 +3281,12 @@ class DhanBroker:
             if positions is None:
                 logger.warning("[INDIA INTRADAY] square-off skipped: positions unavailable")
                 return closed
+
+        if len(positions) == 0:
+            logger.info("[SQUAREOFF SKIP] No open positions")
+            logger.info("[SQUAREOFF] No open positions — skipping")
+            self._squareoff_done_today = True
+            return []
 
         for symbol in list(positions.keys()):
             if gap > 0:
@@ -3247,4 +3427,7 @@ class DhanBroker:
             logger.critical(
                 f"[INDIA INTRADAY] square-off incomplete — still open/rejected: {failed}"
             )
+        else:
+            self._squareoff_done_today = True
+            logger.info("[SQUAREOFF DONE] All positions flattened")
         return closed

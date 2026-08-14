@@ -61,6 +61,8 @@ class RiskManager:
         self._trade_meta: dict[str, dict] = {}
         # Pending entry risk (orders submitted, not yet filled/failed): symbol -> ₹ risk
         self._pending_risk: dict[str, float] = {}
+        # MIS margin booked per open symbol (₹)
+        self._margin_by_symbol: dict[str, float] = {}
         self._entry_lock = threading.RLock()
 
         clusters = (
@@ -139,43 +141,81 @@ class RiskManager:
         equity: float,
         price: float,
         stop_distance: float | None = None,
+        *,
+        symbol: str = "",
+        available_cash: float | None = None,
     ) -> int:
         """
-        Size by risk-per-trade when stop_distance is known:
-          shares = floor((equity × RISK_PER_TRADE) / stop_distance)
-        Also capped by MAX_POSITION_PCT of equity and MAX_SHARES_PER_ORDER.
-        India: caller should pass effective_equity(...) so INDIA_CAPITAL_CAP applies.
+        qty = min(shares_risk, max_by_pct, MAX_SHARES_PER_ORDER)
+        equity = min(equity, available_cash, INDIA_CAPITAL_CAP) on India.
+        MAX_POSITION_PCT=1.00 means 100% of sleeve notional (MIS ~5x on margin).
         """
-        equity = self.effective_equity(equity) if self.market == "INDIA" else float(equity)
+        eq = float(equity or 0)
+        cash = float(available_cash) if available_cash is not None else eq
+        cap = self.capital_cap() if self.market == "INDIA" else 0.0
+        if cap > 0:
+            equity = min(eq, cash, cap)
+        elif available_cash is not None:
+            equity = min(eq, cash)
+        else:
+            equity = self.effective_equity(eq) if self.market == "INDIA" else eq
         if price <= 0 or equity <= 0:
             logger.warning("Invalid equity/price for sizing — 0 shares.")
             return 0
 
-        # Risk-based shares
-        if stop_distance is not None and stop_distance > 0:
-            risk_budget = equity * self.risk_per_trade
-            shares_risk = int(risk_budget // stop_distance)
+        max_shares = int(getattr(config, "MAX_SHARES_PER_ORDER", 500) or 500)
+        stop = float(stop_distance or 0)
+        risk_budget = equity * self.risk_per_trade
+        if stop > 0:
+            shares_risk = risk_budget / stop
         else:
-            # Fallback: % of equity (legacy)
-            shares_risk = int((equity * self.max_position_pct) // price)
-
-        # Hard dollar cap
-        max_by_pct = int((equity * self.max_position_pct) // price)
-        shares = min(shares_risk, max_by_pct) if max_by_pct > 0 else 0
-
-        max_shares = getattr(config, "MAX_SHARES_PER_ORDER", 50)
-        if shares > max_shares:
-            logger.warning(
-                f"Position size capped: {shares} → {max_shares} (MAX_SHARES_PER_ORDER)"
-            )
-            shares = max_shares
-
+            shares_risk = (equity * self.max_position_pct) / price
+        max_by_pct = (equity * self.max_position_pct) / price if price > 0 else 0.0
+        qty = int(min(shares_risk, max_by_pct, max_shares))
+        if qty < 0:
+            qty = 0
+        notional = qty * price
         logger.info(
-            f"Sizing: equity={equity:,.2f} risk={self.risk_per_trade:.2%} "
-            f"stop_dist={stop_distance if stop_distance else 'n/a'} "
-            f"→ {shares} shares @ {price:.2f}"
+            f"[POSITION SIZING] {symbol or '-'}: equity={equity}, "
+            f"risk_budget={risk_budget:.2f}, stop_dist={stop:.2f}, "
+            f"shares_risk={shares_risk}, max_by_pct={max_by_pct}, "
+            f"max_shares={max_shares}, final_qty={qty}, "
+            f"notional={notional:.2f}, est_margin={notional / 5.0:.2f}"
         )
-        return shares
+        return qty
+
+    def total_margin_used(self) -> float:
+        return float(sum((self._margin_by_symbol or {}).values()))
+
+    def add_margin(self, symbol: str, amount: float) -> None:
+        sym = str(symbol or "").upper()
+        if not sym:
+            return
+        if not hasattr(self, "_margin_by_symbol") or self._margin_by_symbol is None:
+            self._margin_by_symbol = {}
+        self._margin_by_symbol[sym] = max(0.0, float(amount or 0))
+
+    def release_margin(self, symbol: str) -> None:
+        if not hasattr(self, "_margin_by_symbol") or not self._margin_by_symbol:
+            return
+        self._margin_by_symbol.pop(str(symbol or "").upper(), None)
+
+    def reset_margin_book(self) -> None:
+        self._margin_by_symbol = {}
+
+    def cluster_for(self, symbol: str) -> str | None:
+        return self._cluster_for(symbol)
+
+    def cluster_open_count(self, symbol: str, current_positions: dict) -> tuple[str | None, int]:
+        cluster = self._cluster_for(symbol)
+        if not cluster:
+            return None, 0
+        n = sum(
+            1
+            for s in (current_positions or {})
+            if self._cluster_for(s) == cluster
+        )
+        return cluster, n
 
     # -----------------------------------------------------------------------
     # ATR Stop / Take-Profit / Trailing
@@ -721,8 +761,8 @@ class RiskManager:
             )
             if held_in_cluster >= self.max_cluster_positions:
                 logger.info(
-                    f"{symbol}: Cluster '{cluster}' already has "
-                    f"{held_in_cluster} positions (cap={self.max_cluster_positions}) — skip."
+                    f"[CLUSTER BLOCK] {symbol}: sector {cluster} already has "
+                    f"{held_in_cluster} positions"
                 )
                 return False
 

@@ -314,7 +314,7 @@ INDIA_ADX_RANGE_MAX: float = _env_float("INDIA_ADX_RANGE_MAX", str(ADX_RANGE_MAX
 # Risk Parameters — size by risk-to-stop, not only % of equity
 # ===========================================================================
 RISK_PER_TRADE: float = _env_float("RISK_PER_TRADE", "0.006")  # 0.6% equity (MIS band)
-MAX_POSITION_PCT: float = _env_float("MAX_POSITION_PCT", "0.12")  # hard cap
+MAX_POSITION_PCT: float = _env_float("MAX_POSITION_PCT", "1.00")  # 1.00 = 100% of sleeve (5x MIS notional)
 ATR_STOP_MULT: float = _env_float("ATR_STOP_MULT", "1.2")
 ATR_TRAIL_MULT: float = _env_float("ATR_TRAIL_MULT", "1.2")
 TAKE_PROFIT_R: float = _env_float("TAKE_PROFIT_R", "1.25")  # tighter than CNC swing
@@ -324,11 +324,11 @@ TAKE_PROFIT_PCT: float = _env_float("TAKE_PROFIT_PCT", "0.009")
 # Orphan MIS rescue (broker open, no local sl_tp_meta). 0 SL → use STOP_LOSS_PCT.
 ZOMBIE_SL_PCT: float = _env_float("ZOMBIE_SL_PCT", "0.0045")
 ZOMBIE_TP_PCT: float = _env_float("ZOMBIE_TP_PCT", "0.008")
-DAILY_DRAWDOWN_LIMIT: float = _env_float("DAILY_DRAWDOWN_LIMIT", "0.02")
+DAILY_DRAWDOWN_LIMIT: float = _env_float("DAILY_DRAWDOWN_LIMIT", "0.05")
 # Hard stop on journal entries opened today (IST). 0 = unlimited (off).
 MAX_TRADES_PER_DAY: int = _env_int("MAX_TRADES_PER_DAY", "0")
 # Absolute ₹ loss hard stop (in addition to DAILY_DRAWDOWN_LIMIT %). 0 = off.
-MAX_DAILY_LOSS_INR: float = _env_float("MAX_DAILY_LOSS_INR", "0")
+MAX_DAILY_LOSS_INR: float = _env_float("MAX_DAILY_LOSS_INR", "15000")
 MAX_SHARES_PER_ORDER: int = _env_int("MAX_SHARES_PER_ORDER", "500")
 MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", "2")
 MAX_CLUSTER_POSITIONS: int = _env_int("MAX_CLUSTER_POSITIONS", "2")

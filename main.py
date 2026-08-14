@@ -226,11 +226,7 @@ def _india_try_buy(
         logger.warning(f"{symbol}: BUY skipped — no usable price")
         return False
 
-    sizing_equity = min(
-        current_equity,
-        float(account.get("available_cash") or current_equity),
-    )
-    sizing_equity = risk_mgr.effective_equity(sizing_equity)
+    sizing_cash = float(account.get("available_cash") or current_equity)
     sl = risk_mgr.get_stop_loss_price(limit_price, atr)
     tp = risk_mgr.get_take_profit_price(limit_price, stop_loss_price=sl, atr=atr)
     ok_cf, why_cf = risk_mgr.passes_cost_floor(limit_price, tp)
@@ -239,16 +235,58 @@ def _india_try_buy(
         return False
     stop_dist = limit_price - sl
     qty = risk_mgr.calculate_position_size(
-        sizing_equity, limit_price, stop_distance=stop_dist
+        current_equity,
+        limit_price,
+        stop_distance=stop_dist,
+        symbol=symbol,
+        available_cash=sizing_cash,
     )
     if qty <= 0:
         logger.warning(
             f"{symbol}: BUY skipped — sized to 0 shares "
-            f"(price={limit_price:.2f}, equity={sizing_equity:.0f})"
+            f"(price={limit_price:.2f}, equity={current_equity:.0f})"
         )
         return False
 
     new_risk = max(stop_dist, 0.0) * qty
+    sizing_equity = risk_mgr.effective_equity(min(current_equity, sizing_cash))
+
+    # Cluster guard before max-open / already-held CAP
+    cluster_fn = getattr(risk_mgr, "cluster_open_count", None)
+    if callable(cluster_fn):
+        pair = cluster_fn(symbol, current_positions)
+        if isinstance(pair, (tuple, list)) and len(pair) == 2:
+            cluster, cluster_n = pair
+            cap_n = int(getattr(risk_mgr, "max_cluster_positions", 2) or 2)
+            if cluster and int(cluster_n or 0) >= cap_n:
+                logger.info(
+                    f"[CLUSTER BLOCK] {symbol}: sector {cluster} already has {cluster_n} positions"
+                )
+                return False
+
+    product = str(getattr(config, "INDIA_PRODUCT_TYPE", "INTRADAY") or "INTRADAY")
+    margin_required = 0.0
+    if hasattr(india_broker, "get_margin_required"):
+        try:
+            margin_required = float(
+                india_broker.get_margin_required(symbol, qty, limit_price, product) or 0
+            )
+        except Exception:
+            margin_required = 0.0
+    if margin_required <= 0:
+        margin_required = (qty * limit_price) / 5.0
+    used = 0.0
+    if hasattr(risk_mgr, "total_margin_used"):
+        try:
+            used = float(risk_mgr.total_margin_used() or 0)
+        except Exception:
+            used = 0.0
+    free = sizing_cash - used
+    if margin_required > free:
+        logger.info(
+            f"[MARGIN REJECTED] {symbol}: needs {margin_required}, free {free}"
+        )
+        return False
 
     # Atomic Core/Scout gate: position limits + portfolio risk + symbol reservation
     with risk_mgr.entry_gate():
@@ -275,6 +313,8 @@ def _india_try_buy(
             stop_loss_price=sl,
             take_profit_price=tp,
             atr=atr,
+            available_cash=sizing_cash,
+            margin_used=used,
         )
         if not order_id:
             logger.warning(
@@ -332,6 +372,8 @@ def _india_try_buy(
                 "qty": fill_qty,
                 "avg_entry_price": entry_px,
             }
+            booked = margin_required * (fill_qty / float(qty)) if qty else margin_required
+            risk_mgr.add_margin(symbol, booked)
             return True
 
         if fill_qty <= 0:
@@ -410,6 +452,8 @@ def _india_try_buy(
             "qty": fill_qty,
             "avg_entry_price": entry_px,
         }
+        booked = margin_required * (fill_qty / float(qty)) if qty else margin_required
+        risk_mgr.add_margin(symbol, booked)
         return True
     finally:
         risk_mgr.clear_pending_risk(symbol)
@@ -431,6 +475,11 @@ def _india_restore_runtime_state(india_broker, risk_mgr, strategy) -> None:
         risk_mgr.load_state()
     except Exception as e:
         logger.debug(f"risk state load: {e}")
+    if hasattr(india_broker, "load_sl_tp_meta"):
+        try:
+            india_broker.load_sl_tp_meta()
+        except Exception as e:
+            logger.debug(f"sl_tp_meta load: {e}")
     if strategy is not None and hasattr(strategy, "load_fired_state"):
         try:
             strategy.load_fired_state()
@@ -492,6 +541,7 @@ def _india_restore_runtime_state(india_broker, risk_mgr, strategy) -> None:
         f"[INDIA] Startup reconcile done | broker_open={list(positions.keys())} "
         f"| meta={list(risk_mgr._trade_meta.keys())}"
     )
+    _rebuild_india_margin_book(india_broker, risk_mgr, positions)
     if hasattr(india_broker, "rescue_zombie_positions"):
         try:
             rescued = india_broker.rescue_zombie_positions(risk_mgr, strategy)
@@ -499,6 +549,28 @@ def _india_restore_runtime_state(india_broker, risk_mgr, strategy) -> None:
                 logger.warning(f"[INDIA] Startup ZOMBIE RESCUED: {rescued}")
         except Exception as ze:
             logger.debug(f"[INDIA] startup zombie rescue skipped: {ze}")
+
+
+def _rebuild_india_margin_book(india_broker, risk_mgr, positions: dict | None) -> None:
+    """Recompute in-memory MIS margin from broker-open qty (API, else notional/5)."""
+    if not hasattr(risk_mgr, "reset_margin_book"):
+        return
+    risk_mgr.reset_margin_book()
+    product = str(getattr(config, "INDIA_PRODUCT_TYPE", "INTRADAY") or "INTRADAY")
+    for sym, pos in (positions or {}).items():
+        qty = int((pos or {}).get("qty") or 0)
+        px = float((pos or {}).get("avg_entry_price") or (pos or {}).get("current_price") or 0)
+        if qty <= 0 or px <= 0:
+            continue
+        m = 0.0
+        if hasattr(india_broker, "get_margin_required"):
+            try:
+                m = float(india_broker.get_margin_required(sym, qty, px, product) or 0)
+            except Exception:
+                m = 0.0
+        if m <= 0:
+            m = (qty * px) / 5.0
+        risk_mgr.add_margin(sym, m)
 
 
 def _india_try_sell(
@@ -533,6 +605,7 @@ def _india_try_sell(
             )
             # Position may be flat at broker; clear local meta but leave journal open
             risk_mgr.clear_trade(symbol)
+            risk_mgr.release_margin(symbol)
             current_positions.pop(symbol, None)
             return True
         qty = int(getattr(india_broker, "last_fill_qty", 0) or pos.get("qty") or 0) or None
@@ -540,6 +613,7 @@ def _india_try_sell(
             "INDIA", symbol, px, reason="signal_sell", qty=qty
         )
         risk_mgr.clear_trade(symbol)
+        risk_mgr.release_margin(symbol)
         alerts.trade_alert("INDIA", "SELL", symbol, f"@{px}")
         current_positions.pop(symbol, None)
         return True
@@ -577,6 +651,7 @@ def _reconcile_india_journal(india_broker, risk_mgr, current_positions: dict) ->
         )
         for sym in closed:
             risk_mgr.clear_trade(sym)
+            risk_mgr.release_margin(sym)
             if current_positions is not None:
                 current_positions.pop(sym, None)
         if closed:
@@ -669,6 +744,15 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                     india_broker.paper.start_of_day_equity = None
                 logger.info(f"[INDIA] New day {now_ist.date()} — kill-switch reset")
 
+            if hasattr(india_broker, "maybe_session_reset"):
+                try:
+                    prev_reset = getattr(india_broker, "_session_reset_day", None)
+                    india_broker.maybe_session_reset(now_ist)
+                    if getattr(india_broker, "_session_reset_day", None) != prev_reset:
+                        risk_mgr.reset_margin_book()
+                except Exception:
+                    pass
+
             if not is_india_market_open():
                 logger.info(
                     f"[INDIA STATUS] Market CLOSED ({now_ist.strftime('%A %I:%M %p IST')}). "
@@ -733,6 +817,9 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                         sq = india_broker.square_off_intraday_positions()
                         if sq:
                             logger.info(f"[INDIA INTRADAY AUTO-SQUAREOFF] Closed: {sq}")
+                            for _sym in sq:
+                                risk_mgr.release_margin(_sym)
+                                risk_mgr.clear_trade(_sym)
                         failed = getattr(india_broker, "last_squareoff_failed", None) or []
                         if failed:
                             logger.critical(
@@ -803,6 +890,9 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                         sq = india_broker.square_off_intraday_positions()
                         if sq:
                             logger.warning(f"[INDIA KILL FLATTEN] Closed: {sq}")
+                            for _sym in sq:
+                                risk_mgr.release_margin(_sym)
+                                risk_mgr.clear_trade(_sym)
                 bot_state.mark_healthy("INDIA")
                 time.sleep(config.INDIA_LOOP_INTERVAL_SEC)
                 continue
