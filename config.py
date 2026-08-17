@@ -329,6 +329,7 @@ DAILY_DRAWDOWN_LIMIT: float = _env_float("DAILY_DRAWDOWN_LIMIT", "0.05")
 MAX_TRADES_PER_DAY: int = _env_int("MAX_TRADES_PER_DAY", "0")
 # Absolute ₹ loss hard stop (in addition to DAILY_DRAWDOWN_LIMIT %). 0 = off.
 MAX_DAILY_LOSS_INR: float = _env_float("MAX_DAILY_LOSS_INR", "15000")
+MIN_STOP_PCT: float = _env_float("MIN_STOP_PCT", "0.0")  # 0 = off; floor on SL/TP/sizing distance
 MAX_SHARES_PER_ORDER: int = _env_int("MAX_SHARES_PER_ORDER", "500")
 MAX_OPEN_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", "2")
 MAX_CLUSTER_POSITIONS: int = _env_int("MAX_CLUSTER_POSITIONS", "2")

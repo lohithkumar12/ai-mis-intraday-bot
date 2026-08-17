@@ -165,6 +165,9 @@ class RiskManager:
 
         max_shares = int(getattr(config, "MAX_SHARES_PER_ORDER", 500) or 500)
         stop = float(stop_distance or 0)
+        min_stop_pct = float(getattr(config, "MIN_STOP_PCT", 0.0) or 0.0)
+        if min_stop_pct > 0 and price > 0:
+            stop = max(stop, price * min_stop_pct)
         risk_budget = equity * self.risk_per_trade
         if stop > 0:
             shares_risk = risk_budget / stop
@@ -175,12 +178,15 @@ class RiskManager:
         if qty < 0:
             qty = 0
         notional = qty * price
+        stop_pct = (stop / price * 100.0) if price > 0 else 0.0
         logger.info(
-            f"[POSITION SIZING] {symbol or '-'}: equity={equity}, "
-            f"risk_budget={risk_budget:.2f}, stop_dist={stop:.2f}, "
-            f"shares_risk={shares_risk}, max_by_pct={max_by_pct}, "
-            f"max_shares={max_shares}, final_qty={qty}, "
-            f"notional={notional:.2f}, est_margin={notional / 5.0:.2f}"
+            f"[POSITION SIZING] {symbol or '-'}: equity={equity:.0f}, "
+            f"entry={price:.2f}, stop_dist={stop:.2f} ({stop_pct:.2f}%), "
+            f"risk_budget={risk_budget:.2f}, shares_risk={shares_risk:.0f}, "
+            f"max_by_pct={max_by_pct:.0f}, max_shares={max_shares}, "
+            f"final_qty={qty}, notional={notional:.2f}, "
+            f"est_margin={notional / 5.0:.2f}, "
+            f"lev={(notional / equity if equity > 0 else 0):.2f}x"
         )
         return qty
 
@@ -232,6 +238,10 @@ class RiskManager:
         # Never above entry for longs
         if sl >= entry_price:
             sl = entry_price * (1 - self.stop_loss_pct)
+        min_stop_pct = float(getattr(config, "MIN_STOP_PCT", 0.0) or 0.0)
+        if min_stop_pct > 0 and entry_price > 0:
+            min_stop_dist = entry_price * min_stop_pct
+            sl = min(sl, entry_price - min_stop_dist)
         sl = _round_px(self.market, sl, mode="floor")
         return max(sl, 0.01)
 
@@ -568,10 +578,17 @@ class RiskManager:
         if risk <= 0 or (peak - meta["entry"]) < risk:
             return prev_stop
 
+        min_stop_pct = float(getattr(config, "MIN_STOP_PCT", 0.0) or 0.0)
         if use_atr and use_atr > 0:
-            trail = round(peak - (self.atr_trail_mult * use_atr), 2)
+            trail_dist = self.atr_trail_mult * use_atr
+            if min_stop_pct > 0:
+                trail_dist = max(trail_dist, peak * min_stop_pct)
+            trail = round(peak - trail_dist, 2)
         else:
-            trail = round(peak * (1 - self.stop_loss_pct), 2)
+            trail_pct = self.stop_loss_pct
+            if min_stop_pct > 0:
+                trail_pct = max(trail_pct, min_stop_pct)
+            trail = round(peak * (1 - trail_pct), 2)
 
         # Never loosen vs initial OR vs already-ratcheted stop
         effective = max(initial_stop, prev_stop, trail)

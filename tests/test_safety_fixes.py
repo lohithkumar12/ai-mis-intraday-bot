@@ -428,6 +428,7 @@ class TestSquareoffReject(unittest.TestCase):
         broker.paper = None
         broker.last_error = ""
         broker.last_squareoff_failed = []
+        broker._squareoff_done_today = False
         broker.get_open_positions = MagicMock(
             side_effect=[
                 {"HEROMOTOCO": {"qty": 5, "avg_entry_price": 5000.0}},
@@ -447,6 +448,25 @@ class TestSquareoffReject(unittest.TestCase):
         self.assertEqual(closed, [])
         self.assertIn("HEROMOTOCO", broker.last_squareoff_failed)
         rec.assert_not_called()
+
+    def test_squareoff_skips_when_flat_and_when_already_done(self):
+        broker = DhanBroker.__new__(DhanBroker)
+        broker.paper = None
+        broker.last_error = ""
+        broker.last_squareoff_failed = []
+        broker._squareoff_done_today = False
+        broker.get_open_positions = MagicMock(return_value={})
+        broker.close_position = MagicMock(return_value=1.0)
+        with patch.object(config, "INDIA_PRODUCT_TYPE", "INTRADAY"):
+            closed = broker.square_off_intraday_positions()
+        self.assertEqual(closed, [])
+        self.assertTrue(broker._squareoff_done_today)
+        broker.close_position.assert_not_called()
+        broker.get_open_positions.reset_mock()
+        with patch.object(config, "INDIA_PRODUCT_TYPE", "INTRADAY"):
+            closed2 = broker.square_off_intraday_positions()
+        self.assertEqual(closed2, [])
+        broker.get_open_positions.assert_not_called()
 
 
 if __name__ == "__main__":

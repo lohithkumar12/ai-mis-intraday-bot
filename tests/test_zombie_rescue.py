@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -29,6 +30,8 @@ class TestRescueZombiePositions(unittest.TestCase):
         self.broker.paper = None
         self.broker.dhan = None
         self.broker.sl_tp_meta = {}
+        self.broker._zombie_rescue_time = {}
+        self.broker._squareoff_done_today = False
         self.broker.close_position = MagicMock(return_value=None)
         self.rm = RiskManager(market="INDIA")
         self.strat = OpeningRangeBreakoutStrategy(params_for_market("INDIA"))
@@ -133,6 +136,49 @@ class TestRescueZombiePositions(unittest.TestCase):
         self.assertEqual(rescued, ["RELIANCE"])
         self.assertAlmostEqual(self.broker.sl_tp_meta["RELIANCE"]["stop_loss_price"], 1380.0)
         self.assertAlmostEqual(self.broker.sl_tp_meta["RELIANCE"]["target_price"], 1450.0)
+
+    def test_throttles_second_rescue_within_300s(self):
+        self.broker.get_open_positions = MagicMock(
+            return_value={"INFY": {"qty": 2, "avg_entry_price": 1500.0, "current_price": 1490.0}}
+        )
+        self.broker.get_latest_quote = MagicMock(return_value={"ltp": 100.0})
+        self.broker.sl_tp_meta = {}
+        first = self.broker.rescue_zombie_positions(self.rm, self.strat)
+        self.assertEqual(first, ["INFY"])
+        self.broker.sl_tp_meta["INFY"]["active"] = False
+        self.broker.sl_tp_meta["INFY"]["status"] = "COOLDOWN"
+        second = self.broker.rescue_zombie_positions(self.rm, self.strat)
+        self.assertEqual(second, [])
+
+    def test_sl_tp_meta_persists_and_loads(self):
+        self.broker.register_sl_tp("TCS", 90.0, 110.0, qty=3)
+        path = Path(self._tmp.name) / "sl_tp_meta.json"
+        self.assertTrue(path.is_file())
+        other = DhanBroker.__new__(DhanBroker)
+        other.sl_tp_meta = {}
+        other.load_sl_tp_meta()
+        self.assertTrue(other.sl_tp_meta["TCS"].get("active"))
+        self.assertAlmostEqual(float(other.sl_tp_meta["TCS"]["sl"]), 90.0)
+        self.assertAlmostEqual(float(other.sl_tp_meta["TCS"]["tp"]), 110.0)
+
+    def test_session_reset_clears_squareoff_and_zombie_times(self):
+        self.broker._squareoff_done_today = True
+        self.broker._zombie_rescue_time = {"INFY": time.time()}
+        self.broker.reset_session_state()
+        self.assertFalse(self.broker._squareoff_done_today)
+        self.assertEqual(self.broker._zombie_rescue_time, {})
+
+    def test_maybe_session_reset_only_after_0915(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        ist = ZoneInfo("Asia/Kolkata")
+        self.broker._squareoff_done_today = True
+        self.broker._session_reset_day = None
+        self.broker.maybe_session_reset(datetime(2026, 8, 14, 9, 14, tzinfo=ist))
+        self.assertTrue(self.broker._squareoff_done_today)
+        self.broker.maybe_session_reset(datetime(2026, 8, 14, 9, 15, tzinfo=ist))
+        self.assertFalse(self.broker._squareoff_done_today)
 
 
 class TestLoopPlacement(unittest.TestCase):

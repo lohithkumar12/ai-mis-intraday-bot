@@ -130,8 +130,11 @@ def run_backtest(
                 peak_px = max(position.get("peak", position["entry"]), price)
                 position["peak"] = peak_px
                 if risk > 0 and (peak_px - position["entry"]) >= risk and atr and atr > 0:
-                    trail = peak_px - (config.ATR_TRAIL_MULT * atr)
-                    position["stop"] = max(position["stop"], trail)
+                    trail_dist = config.ATR_TRAIL_MULT * atr
+                    min_stop_pct = float(getattr(config, "MIN_STOP_PCT", 0.0) or 0.0)
+                    if min_stop_pct > 0:
+                        trail_dist = max(trail_dist, peak_px * min_stop_pct)
+                    position["stop"] = max(position["stop"], peak_px - trail_dist)
 
                 exit_px = None
                 low = float(bar["low"])
@@ -163,6 +166,9 @@ def run_backtest(
                 if sig == "BUY" and atr and atr > 0:
                     fill = price * (1 + slip)
                     stop = fill - atr_mult * atr
+                    min_stop_pct = float(getattr(config, "MIN_STOP_PCT", 0.0) or 0.0)
+                    if min_stop_pct > 0:
+                        stop = min(stop, fill * (1 - min_stop_pct))
                     stop_dist = fill - stop
                     if stop_dist <= 0:
                         continue

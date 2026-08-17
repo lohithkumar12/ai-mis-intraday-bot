@@ -49,8 +49,8 @@ class TestIndiaCapitalCap(unittest.TestCase):
 
     def test_kill_switch_uses_mis_day_pl_not_equity(self):
         rm = RiskManager(market="INDIA")
+        rm.daily_drawdown_limit = 0.02
         with patch.object(config, "INDIA_CAPITAL_CAP", 300_000):
-            with patch.object(config, "DAILY_DRAWDOWN_LIMIT", 0.02):
                 # Huge equity drop but small journal day P&L → must NOT trip
                 tripped = rm.check_daily_drawdown(
                     326_000, 355_000, day_pl=-401.0
