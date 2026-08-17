@@ -31,7 +31,7 @@ class TestConfirmPendingNotFill(unittest.TestCase):
         broker.get_order_status = MagicMock(return_value=("PENDING", "PENDING"))
         ok, detail = broker.confirm_live_order("oid-p", "INFY", timeout_sec=1.0)
         self.assertFalse(ok)
-        self.assertEqual(detail, "PENDING")
+        self.assertIn("PENDING", detail)
         blocked, reason = order_guards.is_buy_blocked("INFY")
         self.assertTrue(blocked)
         self.assertIn("pending", reason.lower())
@@ -230,6 +230,85 @@ class TestDuplicateExits(unittest.TestCase):
         )
         self.assertIsNone(broker.close_position("SBIN"))
         order_guards.end_exit("SBIN")
+
+
+class TestExitPendingStuck(unittest.TestCase):
+    def setUp(self):
+        order_guards.reset_for_tests()
+
+    def test_end_exit_refuses_while_stuck(self):
+        self.assertTrue(order_guards.try_begin_exit("TCS"))
+        order_guards.mark_exit_pending_stuck("TCS", order_id="oid-exit", status="PENDING")
+        self.assertTrue(order_guards.is_exit_pending_stuck("TCS"))
+        self.assertFalse(order_guards.end_exit("TCS"))
+        self.assertTrue(order_guards.is_exit_inflight("TCS"))
+        self.assertFalse(order_guards.try_begin_exit("TCS"))
+        order_guards.clear_exit_pending_stuck("TCS", reason="TRADED")
+        self.assertFalse(order_guards.is_exit_pending_stuck("TCS"))
+        self.assertTrue(order_guards.try_begin_exit("TCS"))
+        order_guards.end_exit("TCS")
+
+    def test_force_end_exit_clears_stuck(self):
+        order_guards.mark_exit_pending_stuck("INFY", order_id="x", status="PENDING")
+        self.assertTrue(order_guards.end_exit("INFY", force=True))
+        self.assertFalse(order_guards.is_exit_pending_stuck("INFY"))
+
+
+class TestCloseCancelVerify(unittest.TestCase):
+    def setUp(self):
+        order_guards.reset_for_tests()
+
+    def test_skip_sell_when_netqty_zero_after_cancel(self):
+        broker = DhanBroker.__new__(DhanBroker)
+        broker.paper = None
+        broker.dhan = None
+        broker.sl_tp_meta = {}
+        broker.last_super_order_id = None
+        broker.last_sl_order_id = None
+        broker.place_sell_order = MagicMock()
+        broker.get_open_positions = MagicMock(return_value={})
+        self.assertIsNone(broker.close_position("INFY"))
+        broker.place_sell_order.assert_not_called()
+        self.assertFalse(order_guards.is_exit_inflight("INFY"))
+
+    def test_pending_exit_marks_stuck_and_keeps_lock(self):
+        broker = DhanBroker.__new__(DhanBroker)
+        broker.paper = None
+        broker.dhan = None
+        broker.sl_tp_meta = {}
+        broker.last_super_order_id = None
+        broker.last_sl_order_id = None
+        broker.last_error = ""
+        broker.last_fill_qty = 0
+        broker.last_order_status = "PENDING"
+        broker.get_open_positions = MagicMock(
+            return_value={
+                "INFY": {
+                    "qty": 10,
+                    "side": "BUY",
+                    "avg_entry_price": 1400.0,
+                    "current_price": 1390.0,
+                    "product": "INTRADAY",
+                }
+            }
+        )
+        broker.place_sell_order = MagicMock(return_value="oid-exit")
+        broker.confirm_live_order = MagicMock(return_value=(False, "PENDING"))
+        self.assertIsNone(broker.close_position("INFY"))
+        self.assertTrue(order_guards.is_exit_pending_stuck("INFY"))
+        self.assertFalse(order_guards.end_exit("INFY"))
+        self.assertFalse(order_guards.try_begin_exit("INFY"))
+
+    def test_reconcile_stuck_clears_on_traded(self):
+        order_guards.mark_exit_pending_stuck("WIPRO", order_id="oid-w", status="PENDING")
+        broker = DhanBroker.__new__(DhanBroker)
+        broker.paper = None
+        broker.get_order_status = MagicMock(return_value=("TRADED", "TRADED"))
+        broker.get_open_positions = MagicMock(return_value={})
+        released = broker.reconcile_stuck_exits()
+        self.assertIn("WIPRO", released)
+        self.assertFalse(order_guards.is_exit_pending_stuck("WIPRO"))
+
 
 
 class TestJournalSource(unittest.TestCase):

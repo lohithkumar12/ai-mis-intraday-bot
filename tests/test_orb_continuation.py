@@ -261,6 +261,8 @@ class TestIndiaTryBuyOrbContinuation(unittest.TestCase):
         ) as og, patch("main.bot_state") as bs:
             bs.is_tide_bearish.return_value = False
             og.is_buy_blocked.return_value = (False, "")
+            og.is_exit_pending_stuck.return_value = False
+            og.is_exit_inflight.return_value = False
             og.try_reserve_buy.return_value = (True, "")
             ok = _india_try_buy(
                 india_broker=broker,

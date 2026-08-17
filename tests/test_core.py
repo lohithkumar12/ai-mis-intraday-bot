@@ -225,6 +225,15 @@ class TestIndiaScoutScoring(unittest.TestCase):
         self.assertIn('INDIA_LOOP_INTERVAL_SEC", "60"', src)
         self.assertIn("opening_range_breakout", src)
 
+    def test_rotating_file_handler_in_main(self):
+        src = Path(__file__).resolve().parents[1].joinpath("main.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("RotatingFileHandler", src)
+        self.assertIn("50 * 1024 * 1024", src)
+        self.assertIn("backupCount=5", src)
+        self.assertNotIn("logging.FileHandler(", src)
+
     def test_insufficient_bars(self):
         df = _ohlcv(np.linspace(100, 110, 20))
         df = self.strat.compute_indicators(df)

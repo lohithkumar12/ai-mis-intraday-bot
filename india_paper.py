@@ -261,12 +261,12 @@ class IndiaPaperPortfolio:
             IST = pytz.timezone("Asia/Kolkata")
 
         now_ist = datetime.now(IST)
-        raw = getattr(config, "SQUAREOFF_TIME", "15:00") or "15:00"
+        raw = getattr(config, "SQUAREOFF_TIME", "14:55") or "14:55"
         try:
             hh, mm = raw.split(":")[:2]
             cutoff = now_ist.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
         except Exception:
-            cutoff = now_ist.replace(hour=15, minute=0, second=0, microsecond=0)
+            cutoff = now_ist.replace(hour=14, minute=55, second=0, microsecond=0)
         closed = []
 
         product = (config.INDIA_PRODUCT_TYPE or "").strip().upper()

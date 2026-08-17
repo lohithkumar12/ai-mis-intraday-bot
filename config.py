@@ -347,11 +347,14 @@ ALLOW_OPEN_CLOSE_WINDOW: bool = _env_bool("ALLOW_OPEN_CLOSE_WINDOW", "false")
 # Earlier than broker RMS (~15:15) so we are not racing square-off.
 ENTRY_CUTOFF: str = os.getenv("ENTRY_CUTOFF", "14:15").strip()
 # Bot square-off start HH:MM IST — MUST be before broker MIS cutoff (~15:15–15:20)
-SQUAREOFF_TIME: str = os.getenv("SQUAREOFF_TIME", "15:00").strip()
+SQUAREOFF_TIME: str = os.getenv("SQUAREOFF_TIME", "14:55").strip()
 DAILY_FLATTEN_ON_KILL: bool = _env_bool("DAILY_FLATTEN_ON_KILL", "true")
 # Sleep between flatten API calls (positions/orders) to avoid DH-904 / HTTP 429
 FLATTEN_API_GAP_SEC: float = _env_float("FLATTEN_API_GAP_SEC", "1.5")
 FLATTEN_RATE_LIMIT_BACKOFF_SEC: float = _env_float("FLATTEN_RATE_LIMIT_BACKOFF_SEC", "8")
+# Random stagger between MIS flatten symbols (seconds)
+FLATTEN_STAGGER_MIN_SEC: float = _env_float("FLATTEN_STAGGER_MIN_SEC", "1.0")
+FLATTEN_STAGGER_MAX_SEC: float = _env_float("FLATTEN_STAGGER_MAX_SEC", "2.5")
 # Pre-trade cost floor: expected TP move must cover RT fees + min edge (₹/share equiv).
 # Approx MIS RT fees ~0.05% of notional + fixed; MIN_EDGE_BPS is extra buffer.
 COST_FLOOR_RT_PCT: float = _env_float("COST_FLOOR_RT_PCT", "0.0005")  # 5 bps RT
@@ -367,6 +370,10 @@ ALLOW_MARKET_ENTRIES: bool = _env_bool("ALLOW_MARKET_ENTRIES", "false")
 # is known (modify_order / modify_super_order). Never loosens. If no order id is
 # stored after restart, local trail still runs but broker sync is skipped.
 SYNC_BROKER_STOPS: bool = _env_bool("SYNC_BROKER_STOPS", "true")
+# Retry modify_super_order / modify_order this many times before giving up.
+SYNC_BROKER_STOP_RETRIES: int = _env_int("SYNC_BROKER_STOP_RETRIES", "3")
+# Skip new buys when LTP is within this fraction of the NSE upper circuit.
+CIRCUIT_PROXIMITY_PCT: float = _env_float("CIRCUIT_PROXIMITY_PCT", "0.0005")
 # TTL for Core/Scout buy reservation lock (seconds)
 BUY_RESERVE_TTL_SEC: float = _env_float("BUY_RESERVE_TTL_SEC", "45")
 

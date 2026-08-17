@@ -663,12 +663,12 @@ class RiskManager:
 
     @staticmethod
     def squareoff_hm() -> tuple[int, int]:
-        raw = getattr(config, "SQUAREOFF_TIME", "15:00") or "15:00"
+        raw = getattr(config, "SQUAREOFF_TIME", "14:55") or "14:55"
         try:
             hh, mm = raw.split(":")[:2]
             return int(hh), int(mm)
         except Exception:
-            return 15, 0
+            return 14, 55
 
     def past_squareoff(self, now: datetime | None = None) -> bool:
         if now is None:

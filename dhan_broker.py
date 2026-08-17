@@ -23,6 +23,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
+import random
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -51,6 +53,19 @@ _FILL_STATUSES = frozenset({"TRADED", "PART_TRADED", "COMPLETE", "COMPLETED"})
 _OPEN_STATUSES = frozenset(
     {"PENDING", "TRANSIT", "OPEN", "TRIGGER_PENDING", "AFTER_MARKET_ORDER_REQ"}
 )
+_BRACKET_PENDING_STATUSES = frozenset(
+    {
+        "PENDING",
+        "TRANSIT",
+        "OPEN",
+        "TRIGGER_PENDING",
+        "TRIGGER PENDING",
+        "PART_TRADED",
+        "AFTER_MARKET_ORDER_REQ",
+    }
+)
+BRACKET_CANCEL_TIMEOUT_SEC = 1.5
+BRACKET_CANCEL_POLL_SEC = 0.1
 
 
 def _dhan_product_type(product_type: str | None = None):
@@ -194,6 +209,13 @@ class DhanBroker:
         self._marketfeed_cooldown_until = 0.0
         self._quote_warn_at: dict[str, float] = {}
         self._login_lock = threading.Lock()
+        self._flatten_q: queue.Queue = queue.Queue()
+        self._flatten_lock = threading.Lock()
+        self._flatten_queued: set[str] = set()
+        self._flatten_thread: threading.Thread | None = None
+        self._flatten_risk_mgr = None
+        self._exit_health_thread: threading.Thread | None = None
+        self._exit_health_stop = threading.Event()
 
         self.paper = IndiaPaperPortfolio() if config.INDIA_PAPER else None
         mode = "PAPER SIM (live NSE data, fake INR)" if self.paper else "LIVE REAL MONEY"
@@ -840,6 +862,64 @@ class DhanBroker:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _quote_extras_from_node(node: dict | None) -> dict:
+        """Pull circuit / depth fields when the marketfeed payload has them."""
+        extra: dict = {}
+        if not isinstance(node, dict):
+            return extra
+        ohlc = node.get("ohlc") if isinstance(node.get("ohlc"), dict) else {}
+        mapping = {
+            "upper_circuit": (
+                "upper_circuit_limit",
+                "upperCircuitLimit",
+                "upper_circuit",
+                "upper_circuit_limit_price",
+            ),
+            "lower_circuit": (
+                "lower_circuit_limit",
+                "lowerCircuitLimit",
+                "lower_circuit",
+            ),
+            "ask_qty": (
+                "sell_quantity",
+                "sellQuantity",
+                "sell_qty",
+                "ask_qty",
+                "askQuantity",
+            ),
+            "best_ask": ("best_ask", "ask", "sell_price"),
+        }
+        for out_key, keys in mapping.items():
+            for k in keys:
+                raw = node.get(k)
+                if raw is None or raw == "":
+                    raw = ohlc.get(k) if ohlc else None
+                if raw is None or raw == "":
+                    continue
+                try:
+                    extra[out_key] = float(raw)
+                    break
+                except (TypeError, ValueError):
+                    continue
+        depth = node.get("depth") or node.get("marketDepth") or {}
+        if isinstance(depth, dict):
+            sells = depth.get("sell") or depth.get("asks") or []
+            if isinstance(sells, list) and sells:
+                top = sells[0] if isinstance(sells[0], dict) else {}
+                try:
+                    q = float(top.get("quantity") or top.get("qty") or 0)
+                    extra["ask_qty"] = q
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    px = float(top.get("price") or top.get("ltp") or 0)
+                    if px > 0:
+                        extra["best_ask"] = px
+                except (TypeError, ValueError):
+                    pass
+        return extra
+
     def _cache_quote(self, symbol: str, quote: dict) -> dict:
         self._quote_cache[symbol] = (time.time(), quote)
         return quote
@@ -958,16 +1038,23 @@ class DhanBroker:
                 self._quote_warn(symbol, f"{symbol}: LTP missing in marketfeed payload")
                 return self._quote_from_candle_cache(symbol)
 
-            return self._cache_quote(
-                symbol,
-                {
-                    "ltp": ltp,
-                    "ask_price": ltp,
-                    "symbol": symbol,
-                    "exchange": get_exchange(symbol),
-                    "source": "ticker_data",
-                },
-            )
+            extras = {}
+            try:
+                data = self._data(resp)
+                bucket = data.get(segment) or data.get(str(sec_id)) or data if isinstance(data, dict) else {}
+                node = bucket.get(str(sec_id)) or bucket.get(int(sec_id)) or bucket if isinstance(bucket, dict) else {}
+                extras = self._quote_extras_from_node(node if isinstance(node, dict) else None)
+            except Exception:
+                extras = {}
+            quote = {
+                "ltp": ltp,
+                "ask_price": extras.get("best_ask") or ltp,
+                "symbol": symbol,
+                "exchange": get_exchange(symbol),
+                "source": "ticker_data",
+            }
+            quote.update(extras)
+            return self._cache_quote(symbol, quote)
         except Exception as e:
             msg = str(e).lower()
             if "429" in msg or "rate" in msg:
@@ -1426,19 +1513,43 @@ class DhanBroker:
                         self.last_fill_price = fill_px
                 except Exception:
                     pass
+                if last_status == "PART_TRADED" or (
+                    0 < int(self.last_fill_qty or 0) < int(
+                        getattr(self, "_confirm_intended_qty", 0) or 0
+                    )
+                ):
+                    try:
+                        snap = self.get_order_fill_snapshot(order_id)
+                        rem = int(snap.get("remaining_qty") or 0)
+                        filled = int(self.last_fill_qty or snap.get("filled_qty") or 0)
+                        if rem > 0 or filled > 0:
+                            self.cancel_unfilled_remainder(
+                                order_id,
+                                symbol=symbol,
+                                filled_qty=filled,
+                                remaining_qty=rem,
+                                super_order_id=getattr(self, "last_super_order_id", None),
+                            )
+                    except Exception as ce:
+                        logger.debug(f"{symbol}: remainder cancel on confirm skip: {ce}")
                 return True, last_status
             time.sleep(0.75)
 
         if last_status in _OPEN_STATUSES or last_status in ("", "UNKNOWN"):
+            adopted, adopt_status = self._adopt_or_cancel_open_entry(
+                order_id, symbol, last_status=last_status or "PENDING"
+            )
+            if adopted:
+                return True, adopt_status
             logger.warning(
-                f"{symbol}: order {order_id} still {last_status or 'PENDING'} "
-                f"after {timeout:.0f}s — NOT treating as fill; cooldown on re-buy"
+                f"{symbol}: order {order_id} still {adopt_status or last_status or 'PENDING'} "
+                f"after {timeout:.0f}s — cancelled leftover; NOT treating as fill"
             )
             order_guards.block_buy_after_pending(symbol, order_id)
             self._set_sl_tp_status(symbol, "COOLDOWN", order_id=order_id)
-            self.last_error = f"pending:{last_status or 'PENDING'}"
-            self.last_order_status = last_status or "PENDING"
-            return False, last_status or "PENDING"
+            self.last_error = f"pending:{adopt_status or last_status or 'PENDING'}"
+            self.last_order_status = adopt_status or last_status or "PENDING"
+            return False, adopt_status or last_status or "PENDING"
 
         if last_status in _REJECT_STATUSES:
             order_guards.block_buy_after_reject(symbol, last_detail)
@@ -1449,6 +1560,76 @@ class DhanBroker:
         self.last_error = f"unconfirmed:{last_status}"
         order_guards.block_buy_after_pending(symbol, order_id)
         return False, last_status
+
+    def _adopt_or_cancel_open_entry(
+        self,
+        order_id: str,
+        symbol: str,
+        *,
+        last_status: str = "PENDING",
+    ) -> tuple[bool, str]:
+        """
+        After confirm timeout: adopt a late fill, else cancel leftover working qty.
+
+        Returns (adopted, status). adopted=True means filled_qty>0 and local
+        last_fill_* is set. Remaining qty is cancelled either way.
+        """
+        snap = {}
+        try:
+            snap = self.get_order_fill_snapshot(order_id) or {}
+        except Exception:
+            snap = {}
+        filled = int(snap.get("filled_qty") or 0)
+        remaining = int(snap.get("remaining_qty") or 0)
+        status = str(snap.get("status") or last_status or "PENDING").upper()
+        avg = float(snap.get("average_price") or 0)
+        super_id = getattr(self, "last_super_order_id", None)
+
+        if filled > 0:
+            self.last_fill_qty = filled
+            if avg > 0:
+                self.last_fill_price = avg
+            self.last_order_status = status if status in _FILL_STATUSES else "PART_TRADED"
+            self.cancel_unfilled_remainder(
+                order_id,
+                symbol=symbol,
+                filled_qty=filled,
+                remaining_qty=remaining,
+                super_order_id=super_id,
+            )
+            logger.warning(
+                f"{symbol}: timeout adopt fill qty={filled} remaining={remaining} "
+                f"status={self.last_order_status}"
+            )
+            return True, self.last_order_status
+
+        # Zero fill — cancel so a later glitch fill cannot become a naked zombie.
+        self.cancel_unfilled_remainder(
+            order_id,
+            symbol=symbol,
+            filled_qty=0,
+            remaining_qty=max(remaining, 1),
+            super_order_id=super_id,
+            force=True,
+        )
+        try:
+            snap2 = self.get_order_fill_snapshot(order_id) or {}
+        except Exception:
+            snap2 = {}
+        filled2 = int(snap2.get("filled_qty") or 0)
+        if filled2 > 0:
+            avg2 = float(snap2.get("average_price") or 0)
+            self.last_fill_qty = filled2
+            if avg2 > 0:
+                self.last_fill_price = avg2
+            self.last_order_status = str(
+                snap2.get("status") or "PART_TRADED"
+            ).upper()
+            logger.warning(
+                f"{symbol}: fill landed during cancel qty={filled2} — adopting"
+            )
+            return True, self.last_order_status
+        return False, "PENDING_CANCELLED"
 
     def get_order_filled_qty(self, order_id: str) -> int:
         """Filled/traded quantity from order book; 0 if unknown."""
@@ -1821,6 +2002,22 @@ class DhanBroker:
         self.last_fill_qty = filled_qty
         self.last_fill_price = avg
         self.last_order_status = status or "PART_TRADED"
+
+        # Drop leftover working qty so a later fill cannot exceed local risk.
+        try:
+            rem = int(snap.get("remaining_qty") or 0)
+            if rem <= 0 and intended > filled_qty:
+                rem = int(intended - filled_qty)
+            if rem > 0 or (0 < filled_qty < intended):
+                self.cancel_unfilled_remainder(
+                    order_id,
+                    symbol=sym,
+                    filled_qty=filled_qty,
+                    remaining_qty=rem,
+                    super_order_id=getattr(self, "last_super_order_id", None),
+                )
+        except Exception as ce:
+            logger.warning(f"{sym}: remainder cancel after PART_TRADED skipped: {ce}")
 
         sl = tp = 0.0
         if risk_mgr is not None:
@@ -2467,28 +2664,246 @@ class DhanBroker:
             logger.error(f"Failed to place SELL for {symbol}: {e}", exc_info=True)
             return None
 
+    def _order_matches_symbol(self, order: dict, symbol: str) -> bool:
+        if not isinstance(order, dict):
+            return False
+        sym = str(symbol or "").upper()
+        sec_id, _ = _resolved_security_id(sym)
+        oid_sec = str(order.get("securityId") or order.get("security_id") or "")
+        if sec_id and oid_sec and str(sec_id) == oid_sec:
+            return True
+        tsym = str(
+            order.get("tradingSymbol")
+            or order.get("trading_symbol")
+            or order.get("symbol")
+            or ""
+        ).upper().replace("-EQ", "")
+        return tsym == sym or tsym.startswith(sym + "-")
+
+    def _pending_bracket_ids(self, symbol: str) -> list[str]:
+        """Order ids still working for this symbol (Super / SL / target / entry)."""
+        ids: list[str] = []
+        seen: set[str] = set()
+
+        def _add(oid: str | None) -> None:
+            s = str(oid or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                ids.append(s)
+
+        row = (getattr(self, "sl_tp_meta", None) or {}).get(str(symbol).upper()) or {}
+        _add(row.get("order_id") or row.get("super_order_id"))
+        _add(row.get("sl_order_id"))
+        _add(getattr(self, "last_super_order_id", None))
+        _add(getattr(self, "last_sl_order_id", None))
+
+        if not getattr(self, "dhan", None):
+            return ids
+        try:
+            resp = self.dhan.get_order_list()
+            data = self._data(resp) if self._ok(resp) else None
+            for order in data or []:
+                if not self._order_matches_symbol(order, symbol):
+                    continue
+                status = str(
+                    order.get("orderStatus") or order.get("status") or ""
+                ).upper()
+                if status not in _BRACKET_PENDING_STATUSES:
+                    continue
+                _add(order.get("orderId") or order.get("order_id"))
+        except Exception as e:
+            logger.warning(f"{symbol}: pending-bracket order-book scan failed: {e}")
+        try:
+            super_list = getattr(self.dhan, "get_super_order_list", None) or getattr(
+                self.dhan, "getSuperOrderList", None
+            )
+            if callable(super_list):
+                resp = super_list()
+                data = self._data(resp) if isinstance(resp, dict) else resp
+                for order in data or []:
+                    if not isinstance(order, dict):
+                        continue
+                    if not self._order_matches_symbol(order, symbol):
+                        continue
+                    status = str(
+                        order.get("orderStatus") or order.get("status") or ""
+                    ).upper()
+                    if status and status not in _BRACKET_PENDING_STATUSES:
+                        continue
+                    _add(
+                        order.get("orderId")
+                        or order.get("order_id")
+                        or order.get("superOrderId")
+                    )
+        except Exception as e:
+            logger.debug(f"{symbol}: super-order list scan skip: {e}")
+        return ids
+
+    def _cancel_order_id(self, oid: str, *, prefer_super: bool = False) -> None:
+        if not oid or not getattr(self, "dhan", None):
+            return
+        methods: list = []
+        if prefer_super:
+            methods.extend(
+                [
+                    getattr(self.dhan, "cancel_super_order", None),
+                    getattr(self.dhan, "cancelSuperOrder", None),
+                ]
+            )
+        methods.append(getattr(self.dhan, "cancel_order", None))
+        last_err = None
+        for fn in methods:
+            if not callable(fn):
+                continue
+            try:
+                fn(str(oid))
+                logger.warning(f"[CANCEL-VERIFY] cancelled working order {oid}")
+                return
+            except Exception as e:
+                last_err = e
+        if last_err:
+            logger.warning(f"[CANCEL-VERIFY] cancel {oid} failed: {last_err}")
+
+    def cancel_unfilled_remainder(
+        self,
+        order_id: str,
+        *,
+        symbol: str = "",
+        filled_qty: int = 0,
+        remaining_qty: int = 0,
+        super_order_id: str | None = None,
+        force: bool = False,
+    ) -> bool:
+        """
+        Cancel leftover working qty after PART_TRADED / confirm timeout.
+
+        Regular orders: cancel_order drops unfilled remainder, keeps fills.
+        Super Orders: cancel ENTRY_LEG only so SL/TP stay armed on filled qty.
+        Never cancels TARGET/STOP legs when filled_qty > 0.
+        """
+        if self.paper is not None:
+            return True
+        filled = int(filled_qty or 0)
+        remaining = int(remaining_qty or 0)
+        if remaining <= 0 and filled > 0 and not force:
+            return True
+        if remaining <= 0 and not force:
+            return True
+        oid = str(order_id or super_order_id or "").strip()
+        if not oid:
+            return False
+        if not getattr(self, "dhan", None):
+            logger.info(
+                f"{symbol or oid}: remainder cancel skipped — no live Dhan client"
+            )
+            return False
+
+        super_id = str(super_order_id or getattr(self, "last_super_order_id", "") or "").strip()
+        logger.warning(
+            f"{symbol or oid}: cancelling unfilled remainder "
+            f"filled={filled} remaining={remaining} order={oid} super={super_id or '-'}"
+        )
+        try:
+            if super_id and hasattr(self.dhan, "cancel_super_order"):
+                try:
+                    resp = self.dhan.cancel_super_order(str(super_id), "ENTRY_LEG")
+                    logger.warning(
+                        f"{symbol or oid}: Super ENTRY_LEG cancel resp={resp}"
+                    )
+                    return True
+                except Exception as se:
+                    logger.warning(
+                        f"{symbol or oid}: Super ENTRY_LEG cancel failed: {se}"
+                    )
+            self._cancel_order_id(oid, prefer_super=bool(super_id))
+            return True
+        except Exception as e:
+            logger.warning(f"{symbol or oid}: remainder cancel error: {e}")
+            return False
+
+    def _cancel_and_verify_brackets(self, symbol: str) -> bool:
+        """
+        Cancel Super Order / SL / target legs, then poll the order book every
+        100ms for up to 1.5s until nothing pending remains.
+        """
+        if self.paper is not None:
+            return True
+        if not getattr(self, "dhan", None):
+            logger.info(f"{symbol}: cancel-verify skipped — no live Dhan client")
+            return True
+
+        pending = self._pending_bracket_ids(symbol)
+        logger.info(
+            f"[CANCEL-VERIFY] {symbol}: cancelling {len(pending)} working bracket/order id(s) "
+            f"{pending or '[]'}"
+        )
+        for oid in pending:
+            self._cancel_order_id(oid, prefer_super=True)
+
+        deadline = time.time() + BRACKET_CANCEL_TIMEOUT_SEC
+        while time.time() < deadline:
+            leftover = self._pending_bracket_ids(symbol)
+            if not leftover:
+                logger.info(
+                    f"[CANCEL-VERIFY] {symbol}: broker confirmed brackets terminated"
+                )
+                return True
+            time.sleep(BRACKET_CANCEL_POLL_SEC)
+
+        leftover = self._pending_bracket_ids(symbol)
+        if leftover:
+            logger.warning(
+                f"[CANCEL-VERIFY] {symbol}: timeout {BRACKET_CANCEL_TIMEOUT_SEC}s — "
+                f"still pending {leftover}; will re-check netQty before SELL"
+            )
+            return False
+        logger.info(f"[CANCEL-VERIFY] {symbol}: brackets clear after poll")
+        return True
+
     def close_position(self, symbol: str) -> float | None:
         """
         Flatten symbol. Returns exit fill price on success, else None.
-        (Truthy float so existing `if close_position(...)` checks keep working.)
+        Cancel-and-verify Super Order legs first; never SELL if fresh netQty <= 0.
         """
         if not order_guards.try_begin_exit(symbol):
-            logger.info(f"{symbol}: close skipped — exit already in flight")
+            logger.info(f"{symbol}: close skipped — exit already in flight or EXIT_PENDING_STUCK")
             return None
         try:
+            self._cancel_and_verify_brackets(symbol)
+
+            # Fresh snapshot AFTER cancel — never sell on a pre-cancel netQty.
             positions = self.get_open_positions()
             if positions is None:
                 logger.warning(f"{symbol}: skip close — positions snapshot unavailable")
                 return None
             if symbol not in positions:
-                logger.warning(f"{symbol}: No open position to close")
+                logger.warning(
+                    f"{symbol}: skip SELL — netQty=0 after cancel-verify "
+                    f"(broker already flat; blocking double-sell)"
+                )
                 return None
             pos = positions[symbol]
-            qty = int(pos["qty"])
+            qty = int(pos.get("qty") or 0)
             side = str(pos.get("side") or "BUY").upper()
+            signed_qty = -qty if side == "SELL" else qty
+            if signed_qty == 0 or qty <= 0:
+                logger.warning(
+                    f"{symbol}: skip flatten — fresh netQty={signed_qty} after cancel-verify "
+                    f"(broker already flat; blocking double-sell)"
+                )
+                return None
+            if signed_qty < 0:
+                logger.warning(
+                    f"{symbol}: skip SELL — fresh netQty={signed_qty} (already short). "
+                    f"Covering with BUY, not another SELL."
+                )
             product = str(pos.get("product") or config.INDIA_PRODUCT_TYPE or "INTRADAY")
             fallback = float(
                 pos.get("current_price") or pos.get("avg_entry_price") or 0
+            )
+            logger.info(
+                f"[CANCEL-VERIFY] {symbol}: netQty={signed_qty} after bracket cancel — "
+                f"placing flatten {'BUY-cover' if side == 'SELL' else 'SELL'}"
             )
             if side == "SELL":
                 # Short position -> BUY to cover.
@@ -2524,6 +2939,16 @@ class DhanBroker:
 
             ok, status = self.confirm_live_order(order_id, symbol)
             if not ok:
+                status_u = str(status or getattr(self, "last_order_status", "") or "").upper()
+                if status_u in _OPEN_STATUSES or status_u in ("", "UNKNOWN", "PENDING"):
+                    order_guards.mark_exit_pending_stuck(
+                        symbol, order_id=str(order_id), status=status_u or "PENDING"
+                    )
+                    logger.error(
+                        f"{symbol}: exit order {order_id} still {status_u or 'PENDING'} — "
+                        f"EXIT_PENDING_STUCK; lock held until TRADED/CANCELLED"
+                    )
+                    return None
                 logger.error(
                     f"{symbol}: exit order {order_id} not filled ({status}) — "
                     f"not journaling as closed"
@@ -2546,7 +2971,12 @@ class DhanBroker:
             )
             return fill
         finally:
-            order_guards.end_exit(symbol)
+            released = order_guards.end_exit(symbol)
+            if not released:
+                logger.warning(
+                    f"{symbol}: exit lock retained (EXIT_PENDING_STUCK) — "
+                    f"5s risk loop will not send a second SELL"
+                )
 
     def sync_broker_stop(
         self,
@@ -2580,57 +3010,72 @@ class DhanBroker:
         if not self.dhan:
             return False
 
-        try:
-            if super_order_id and hasattr(self.dhan, "modify_super_order"):
-                resp = self.dhan.modify_super_order(
-                    order_id=str(super_order_id),
-                    order_type=getattr(dhanhq, "LIMIT", "LIMIT"),
-                    leg_name="STOP_LOSS_LEG",
-                    stopLossPrice=float(new_stop),
-                    trailingJump=0.0,
-                )
-                ok = self._ok(resp) if hasattr(self, "_ok") else True
-                if ok:
-                    logger.info(
-                        f"{symbol}: broker Super SL synced → {new_stop:.2f} "
-                        f"(order={super_order_id})"
+        retries = max(1, int(getattr(config, "SYNC_BROKER_STOP_RETRIES", 3) or 3))
+        last_err = ""
+        for attempt in range(1, retries + 1):
+            try:
+                if super_order_id and hasattr(self.dhan, "modify_super_order"):
+                    resp = self.dhan.modify_super_order(
+                        order_id=str(super_order_id),
+                        order_type=getattr(dhanhq, "LIMIT", "LIMIT"),
+                        leg_name="STOP_LOSS_LEG",
+                        stopLossPrice=float(new_stop),
+                        trailingJump=0.0,
                     )
-                    return True
-                logger.warning(f"{symbol}: modify_super_order failed: {resp}")
-                return False
-
-            if sl_order_id and hasattr(self.dhan, "modify_order"):
-                trigger = float(new_stop)
-                limit_px = float(round_sell_limit(trigger * 0.995))
-                q = int(qty or 0)
-                resp = self.dhan.modify_order(
-                    order_id=str(sl_order_id),
-                    order_type=getattr(dhanhq, "SL", "SL"),
-                    leg_name="",
-                    quantity=q,
-                    price=limit_px,
-                    trigger_price=trigger,
-                    disclosed_quantity=0,
-                    validity=getattr(dhanhq, "DAY", "DAY"),
-                )
-                ok = self._ok(resp) if hasattr(self, "_ok") else True
-                if ok:
-                    logger.info(
-                        f"{symbol}: broker SL order synced → {new_stop:.2f} "
-                        f"(order={sl_order_id})"
+                    ok = self._ok(resp) if hasattr(self, "_ok") else True
+                    if ok:
+                        logger.info(
+                            f"{symbol}: broker Super SL synced → {new_stop:.2f} "
+                            f"(order={super_order_id} attempt={attempt})"
+                        )
+                        return True
+                    last_err = str(resp)
+                    logger.warning(
+                        f"{symbol}: modify_super_order failed attempt {attempt}/{retries}: {resp}"
                     )
-                    return True
-                logger.warning(f"{symbol}: modify_order SL failed: {resp}")
-                return False
-
-            logger.info(
-                f"{symbol}: SYNC_BROKER_STOPS on but no sl/super order id stored — "
-                f"local trail only (cannot safely invent broker modify target)"
-            )
-            return False
-        except Exception as e:
-            logger.warning(f"{symbol}: broker stop sync error: {e}")
-            return False
+                elif sl_order_id and hasattr(self.dhan, "modify_order"):
+                    trigger = float(new_stop)
+                    limit_px = float(round_sell_limit(trigger * 0.995))
+                    q = int(qty or 0)
+                    resp = self.dhan.modify_order(
+                        order_id=str(sl_order_id),
+                        order_type=getattr(dhanhq, "SL", "SL"),
+                        leg_name="",
+                        quantity=q,
+                        price=limit_px,
+                        trigger_price=trigger,
+                        disclosed_quantity=0,
+                        validity=getattr(dhanhq, "DAY", "DAY"),
+                    )
+                    ok = self._ok(resp) if hasattr(self, "_ok") else True
+                    if ok:
+                        logger.info(
+                            f"{symbol}: broker SL order synced → {new_stop:.2f} "
+                            f"(order={sl_order_id} attempt={attempt})"
+                        )
+                        return True
+                    last_err = str(resp)
+                    logger.warning(
+                        f"{symbol}: modify_order SL failed attempt {attempt}/{retries}: {resp}"
+                    )
+                else:
+                    logger.info(
+                        f"{symbol}: SYNC_BROKER_STOPS on but no sl/super order id stored — "
+                        f"local trail only (cannot safely invent broker modify target)"
+                    )
+                    return False
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(
+                    f"{symbol}: broker stop sync error attempt {attempt}/{retries}: {e}"
+                )
+            if attempt < retries:
+                time.sleep(0.35 * attempt)
+        logger.warning(
+            f"{symbol}: broker SL sync exhausted {retries} attempts ({last_err}) — "
+            f"software trail still active, will retry next risk tick"
+        )
+        return False
 
     def _sl_tp_monitor_active(self, symbol: str) -> bool:
         row = (getattr(self, "sl_tp_meta", None) or {}).get(str(symbol or "").upper()) or {}
@@ -2756,6 +3201,43 @@ class DhanBroker:
                 source="zombie_rescue",
             )
             self._zombie_rescue_time[str(symbol).upper()] = time.time()
+
+            # Naked MIS at the broker needs an exchange SL, not only a local monitor.
+            sl_oid = str(prev.get("sl_order_id") or "") or None
+            super_oid = str(prev.get("super_order_id") or "") or None
+            pending = []
+            try:
+                pending = self._pending_bracket_ids(symbol) if self.paper is None else []
+            except Exception:
+                pending = []
+            if (
+                self.paper is None
+                and getattr(self, "dhan", None)
+                and not sl_oid
+                and not super_oid
+                and not pending
+            ):
+                try:
+                    sl_oid = self.place_stoploss_order(symbol, qty, sl)
+                    if sl_oid:
+                        self.last_sl_order_id = str(sl_oid)
+                        self._set_sl_tp_status(
+                            symbol, "ACTIVE", sl_order_id=str(sl_oid)
+                        )
+                        if risk_mgr is not None:
+                            meta = getattr(risk_mgr, "_trade_meta", {}).get(symbol)
+                            if meta is not None:
+                                meta["sl_order_id"] = str(sl_oid)
+                                risk_mgr.persist_state()
+                        logger.warning(
+                            f"[ZOMBIE] {symbol}: broker SL armed {sl_oid} @ {sl:.2f}"
+                        )
+                    else:
+                        logger.error(
+                            f"[ZOMBIE] {symbol}: broker SL place failed — software monitor only"
+                        )
+                except Exception as se:
+                    logger.error(f"[ZOMBIE] {symbol}: broker SL place error: {se}")
 
             if strategy is not None and hasattr(strategy, "mark_day_fired"):
                 try:
@@ -2904,22 +3386,34 @@ class DhanBroker:
                                 current_price,
                             ),
                         )
-                    else:
-                        meta = getattr(risk_mgr, "_trade_meta", {}).get(symbol) or {}
-                        self.sync_broker_stop(
-                            symbol,
-                            sl_price,
-                            qty=int(pos.get("qty") or meta.get("qty") or 0),
-                            sl_order_id=meta.get("sl_order_id"),
-                            super_order_id=meta.get("super_order_id"),
-                            prev_stop=prev,
-                        )
-                        if meta:
-                            meta["stop"] = sl_price
-                            risk_mgr.persist_state()
                         if sl_row:
                             sl_row["stop_loss_price"] = sl_price
                             sl_row["status"] = "ACTIVE"
+                    else:
+                        meta = getattr(risk_mgr, "_trade_meta", {}).get(symbol) or {}
+                        sync_enabled = bool(getattr(config, "SYNC_BROKER_STOPS", False))
+                        synced = True
+                        if sync_enabled:
+                            synced = self.sync_broker_stop(
+                                symbol,
+                                sl_price,
+                                qty=int(pos.get("qty") or meta.get("qty") or 0),
+                                sl_order_id=meta.get("sl_order_id"),
+                                super_order_id=meta.get("super_order_id"),
+                                prev_stop=prev,
+                            )
+                        if synced:
+                            if meta:
+                                meta["stop"] = sl_price
+                                risk_mgr.persist_state()
+                            if sl_row:
+                                sl_row["stop_loss_price"] = sl_price
+                                sl_row["status"] = "ACTIVE"
+                        else:
+                            logger.warning(
+                                f"{symbol}: trail {sl_price:.2f} held in software only "
+                                f"(broker SL still {prev:.2f}) — retry next tick"
+                            )
 
                 if current_price <= sl_price:
                     reason = "stop_loss"
@@ -2935,6 +3429,9 @@ class DhanBroker:
                     )
 
             if reason:
+                if order_guards.is_exit_pending_stuck(symbol):
+                    logger.info(f"{symbol}: SL/TP skip — EXIT_PENDING_STUCK")
+                    continue
                 if order_guards.is_exit_inflight(symbol):
                     logger.info(f"{symbol}: SL/TP skip — exit already in flight")
                     continue
@@ -3288,9 +3785,27 @@ class DhanBroker:
             self._squareoff_done_today = True
             return []
 
-        for symbol in list(positions.keys()):
-            if gap > 0:
-                time.sleep(gap)
+        if getattr(self, "dhan", None) is not None or getattr(self, "paper", None) is not None:
+            try:
+                self.cancel_all_open_orders()
+                logger.info("[SQUAREOFF QUEUE] cancelled resting orders/brackets before flatten")
+            except Exception as ce:
+                logger.warning(f"[SQUAREOFF QUEUE] cancel-all before flatten skip: {ce}")
+
+        for i, symbol in enumerate(list(positions.keys())):
+            if gap > 0 and i > 0:
+                lo = float(getattr(config, "FLATTEN_STAGGER_MIN_SEC", 1.0) or 1.0)
+                hi = float(getattr(config, "FLATTEN_STAGGER_MAX_SEC", 2.5) or 2.5)
+                if hi < lo:
+                    hi = lo
+                stagger = random.uniform(lo, hi)
+                logger.info(
+                    f"[SQUAREOFF QUEUE] {symbol}: stagger {stagger:.2f}s before flatten "
+                    f"(429 / DH-904 guard)"
+                )
+                time.sleep(stagger)
+            elif gap > 0:
+                logger.info(f"[SQUAREOFF QUEUE] {symbol}: first name — flatten now")
             entry = float((positions.get(symbol) or {}).get("avg_entry_price") or 0)
             self.last_error = ""
             fill = self.close_position(symbol)
@@ -3431,3 +3946,114 @@ class DhanBroker:
             self._squareoff_done_today = True
             logger.info("[SQUAREOFF DONE] All positions flattened")
         return closed
+
+    def request_intraday_squareoff(self, risk_mgr=None) -> list[str]:
+        """
+        Non-blocking flatten: start a daemon worker that staggers close_position
+        1.0–2.5s apart. Returns immediately so run_india_loop can skip the 5m scan.
+        """
+        if getattr(self, "_squareoff_done_today", False):
+            logger.info("[SQUAREOFF QUEUE] already done today — skip")
+            return []
+        if not hasattr(self, "_flatten_lock"):
+            self._flatten_lock = threading.Lock()
+        with self._flatten_lock:
+            t = getattr(self, "_flatten_thread", None)
+            if t is not None and t.is_alive():
+                logger.info("[SQUAREOFF QUEUE] worker already active — not stacking another flatten")
+                return []
+            self._flatten_risk_mgr = risk_mgr
+            self._flatten_thread = threading.Thread(
+                target=self._run_squareoff_worker,
+                daemon=True,
+                name="IndiaSquareoffWorker",
+            )
+            self._flatten_thread.start()
+        logger.warning(
+            "[SQUAREOFF QUEUE] non-blocking flatten worker started "
+            "(stagger 1.0–2.5s/symbol, cancel-verify before each SELL)"
+        )
+        return []
+
+    def _run_squareoff_worker(self) -> None:
+        try:
+            closed = self.square_off_intraday_positions()
+            rm = getattr(self, "_flatten_risk_mgr", None)
+            if rm is not None:
+                for sym in closed or []:
+                    try:
+                        rm.release_margin(sym)
+                        rm.clear_trade(sym)
+                    except Exception as re:
+                        logger.debug(f"[SQUAREOFF QUEUE] {sym} risk clear skip: {re}")
+            failed = getattr(self, "last_squareoff_failed", None) or []
+            if failed:
+                logger.critical(
+                    f"[SQUAREOFF QUEUE] worker finished with still-open: {failed}"
+                )
+            else:
+                logger.info(f"[SQUAREOFF QUEUE] worker finished closed={closed}")
+        except Exception as e:
+            logger.critical(f"[SQUAREOFF QUEUE] worker crashed: {e}", exc_info=True)
+
+    def reconcile_stuck_exits(self) -> list[str]:
+        """
+        Health check: release EXIT_PENDING_STUCK when the exit order is
+        TRADED/CANCELLED/REJECTED or the broker is already flat.
+        """
+        released: list[str] = []
+        rows = order_guards.list_exit_pending_stuck()
+        if not rows:
+            return released
+        positions = None
+        try:
+            positions = self.get_open_positions()
+        except Exception as e:
+            logger.debug(f"[EXIT HEALTH] positions fetch skip: {e}")
+
+        for row in rows:
+            symbol = str(row.get("symbol") or "")
+            oid = str(row.get("order_id") or "")
+            terminal = False
+            reason = ""
+            if oid and self.paper is None:
+                try:
+                    status, detail = self.get_order_status(oid)
+                    status_u = str(status or "").upper()
+                    if status_u in _FILL_STATUSES or status_u in _REJECT_STATUSES:
+                        terminal = True
+                        reason = f"order {oid} {status_u}"
+                    logger.info(
+                        f"[EXIT HEALTH] {symbol}: stuck order {oid} status={status_u} "
+                        f"detail={str(detail)[:80]}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[EXIT HEALTH] {symbol}: status poll failed: {e}")
+            if not terminal and positions is not None and symbol not in positions:
+                terminal = True
+                reason = "broker_flat"
+            if terminal:
+                order_guards.clear_exit_pending_stuck(symbol, reason=reason)
+                released.append(symbol)
+                logger.warning(f"[EXIT HEALTH] {symbol}: unlocked ({reason})")
+        return released
+
+    def start_exit_health_monitor(self) -> None:
+        """Daemon: poll stuck exit orders every 2s for TRADED/CANCELLED."""
+        if getattr(self, "_exit_health_thread", None) and self._exit_health_thread.is_alive():
+            return
+        self._exit_health_stop = getattr(self, "_exit_health_stop", None) or threading.Event()
+
+        def _loop():
+            logger.info("[EXIT HEALTH] monitor thread started (2s poll)")
+            while not self._exit_health_stop.wait(2.0):
+                try:
+                    self.reconcile_stuck_exits()
+                except Exception as e:
+                    logger.debug(f"[EXIT HEALTH] cycle skip: {e}")
+
+        self._exit_health_thread = threading.Thread(
+            target=_loop, daemon=True, name="ExitHealthMonitor"
+        )
+        self._exit_health_thread.start()
+

@@ -131,6 +131,76 @@ def mark_vs_entry_sane(entry: float, mark: float) -> tuple[bool, str]:
     return True, ""
 
 
+def _quote_float(quote: dict[str, Any], *keys: str) -> float | None:
+    for k in keys:
+        if k not in quote or quote[k] is None or quote[k] == "":
+            continue
+        try:
+            return float(quote[k])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def india_buy_locked(symbol: str, quote: dict[str, Any] | None) -> tuple[bool, str]:
+    """
+    True when a new NSE equity BUY should not be sent.
+
+    Uses explicit quote fields only (upper circuit, zero ask/sell qty).
+    Missing ask on ticker_data is NOT treated as a lock — that feed often
+    copies LTP into ask_price.
+    """
+    if not quote:
+        return False, ""
+    try:
+        ltp = float(quote.get("ltp") or 0)
+    except (TypeError, ValueError):
+        return False, ""
+    if ltp <= 0:
+        return False, ""
+
+    sell_qty = _quote_float(
+        quote, "ask_qty", "sell_quantity", "sell_qty", "askQuantity", "sellQuantity"
+    )
+    if sell_qty is not None and sell_qty <= 0:
+        return True, f"{symbol}: no sellers (ask_qty=0)"
+
+    ask = _quote_float(quote, "best_ask")
+    if ask is None:
+        raw_ask = _quote_float(quote, "ask_price", "ask")
+        # Ignore synthetic ask_price==ltp from ticker/candle fallbacks.
+        if raw_ask is not None and abs(raw_ask - ltp) > 1e-9:
+            ask = raw_ask
+    if ask is not None and ask <= 0:
+        return True, f"{symbol}: no ask"
+
+    uc = _quote_float(
+        quote,
+        "upper_circuit",
+        "upper_circuit_limit",
+        "upperCircuitLimit",
+        "upper_circuit_limit_price",
+    )
+    if uc is not None and uc > 0:
+        try:
+            import config as _cfg
+
+            prox = float(getattr(_cfg, "CIRCUIT_PROXIMITY_PCT", 0.0005) or 0.0005)
+        except Exception:
+            prox = 0.0005
+        tick = 0.05
+        try:
+            from nse_tick import nse_equity_tick_size
+
+            tick = float(nse_equity_tick_size(ltp) or tick)
+        except Exception:
+            pass
+        band = max(tick, uc * max(prox, 0.0))
+        if ltp + 1e-9 >= uc - band:
+            return True, f"{symbol}: near upper circuit LTP={ltp:.2f} UC={uc:.2f}"
+    return False, ""
+
+
 def require_tradeable_quote(
     symbol: str,
     quote: dict[str, Any] | None,

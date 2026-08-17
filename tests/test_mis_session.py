@@ -39,6 +39,18 @@ class TestMisSessionGates(unittest.TestCase):
             self.assertTrue(rm.past_squareoff(datetime(2026, 8, 10, 15, 0)))
             self.assertFalse(rm.past_squareoff(datetime(2026, 8, 10, 14, 59)))
 
+    def test_squareoff_default_is_1455(self):
+        from pathlib import Path
+
+        src = Path(__file__).resolve().parents[1].joinpath("config.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('SQUAREOFF_TIME", "14:55"', src)
+        rm = RiskManager(market="INDIA")
+        with patch.object(config, "SQUAREOFF_TIME", "14:55"):
+            self.assertTrue(rm.past_squareoff(datetime(2026, 8, 10, 14, 55)))
+            self.assertFalse(rm.past_squareoff(datetime(2026, 8, 10, 14, 54)))
+
 
 if __name__ == "__main__":
     unittest.main()

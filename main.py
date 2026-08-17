@@ -44,6 +44,7 @@ except ImportError:
 
 
 def setup_logging():
+    from logging.handlers import RotatingFileHandler
     from pathlib import Path
 
     log_format = "%(asctime)s | %(levelname)-8s | %(name)-18s | %(message)s"
@@ -59,10 +60,18 @@ def setup_logging():
 
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(log_dir / "trading_bot.log", mode="a", encoding="utf-8")
+    file_handler = RotatingFileHandler(
+        log_dir / "trading_bot.log",
+        maxBytes=50 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(log_format, date_format))
     root_logger.addHandler(file_handler)
+    logging.getLogger("main").info(
+        "Logging to logs/trading_bot.log (RotatingFileHandler 50MB x 5 backups)"
+    )
 
 
 logger = logging.getLogger("main")
@@ -174,6 +183,9 @@ def _india_try_buy(
     if bot_state.is_tide_bearish():
         logger.info(f"{symbol}: BUY skipped — TIDE LOCK")
         return False
+    if order_guards.is_exit_pending_stuck(symbol) or order_guards.is_exit_inflight(symbol):
+        logger.info(f"{symbol}: BUY skipped — EXIT_PENDING_STUCK / exit in flight")
+        return False
 
     continuation = bool((snap or {}).get("orb_continuation"))
 
@@ -225,6 +237,16 @@ def _india_try_buy(
     if limit_price is None or limit_price <= 0:
         logger.warning(f"{symbol}: BUY skipped — no usable price")
         return False
+
+    try:
+        from price_guards import india_buy_locked
+
+        locked, lock_why = india_buy_locked(symbol, quote if isinstance(quote, dict) else None)
+        if locked:
+            logger.info(f"{symbol}: BUY skipped — {lock_why}")
+            return False
+    except Exception as ce:
+        logger.debug(f"{symbol}: circuit/ask guard skip: {ce}")
 
     sizing_cash = float(account.get("available_cash") or current_equity)
     sl = risk_mgr.get_stop_loss_price(limit_price, atr)
@@ -729,6 +751,11 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
         f"| fetch_gap={float(getattr(config, 'INDIA_LOOP_FETCH_GAP_SEC', 0.4) or 0)}s"
     )
     _india_restore_runtime_state(india_broker, risk_mgr, strategy)
+    if hasattr(india_broker, "start_exit_health_monitor"):
+        try:
+            india_broker.start_exit_health_monitor()
+        except Exception as he:
+            logger.warning(f"[INDIA] exit health monitor skip: {he}")
 
     while True:
         try:
@@ -807,13 +834,16 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                 logger.debug(f"[INDIA] early reconcile skipped: {e}")
 
             if config.INDIA_PRODUCT_TYPE.upper() in ("INTRADAY", "INTRA", "MIS"):
-                # Auto square-off from SQUAREOFF_TIME (default 15:00 IST)
+                # Auto square-off from SQUAREOFF_TIME (default 14:55 IST)
                 sq_h, sq_m = risk_mgr.squareoff_hm()
                 if risk_mgr.past_squareoff(now_ist):
                     logger.info(
-                        f"[INDIA MIS SQUAREOFF] >= {sq_h:02d}:{sq_m:02d} IST — flattening"
+                        f"[INDIA MIS SQUAREOFF] >= {sq_h:02d}:{sq_m:02d} IST — "
+                        f"queueing staggered flatten (skip universe scan)"
                     )
-                    if hasattr(india_broker, "square_off_intraday_positions"):
+                    if hasattr(india_broker, "request_intraday_squareoff"):
+                        india_broker.request_intraday_squareoff(risk_mgr=risk_mgr)
+                    elif hasattr(india_broker, "square_off_intraday_positions"):
                         sq = india_broker.square_off_intraday_positions()
                         if sq:
                             logger.info(f"[INDIA INTRADAY AUTO-SQUAREOFF] Closed: {sq}")
@@ -843,6 +873,33 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                             logger.info(
                                 f"[INDIA INTRADAY AUTO-SQUAREOFF] Closed positions: {sq_closed}"
                             )
+                    bot_state.mark_healthy("INDIA")
+                    log_india_portfolio_summary(india_broker, "INDIA")
+                    remaining = float(config.INDIA_LOOP_INTERVAL_SEC)
+                    risk_tick = max(1, int(getattr(config, "INDIA_RISK_CHECK_INTERVAL_SEC", 5)))
+                    logger.info(
+                        "[INDIA] Square-off window — scanner paused; fast SL/TP + "
+                        "EXIT_PENDING_STUCK health only"
+                    )
+                    while remaining > 0:
+                        step = min(float(risk_tick), remaining)
+                        time.sleep(step)
+                        remaining -= step
+                        if remaining <= 0:
+                            break
+                        try:
+                            if hasattr(india_broker, "reconcile_stuck_exits"):
+                                india_broker.reconcile_stuck_exits()
+                            if hasattr(india_broker, "rescue_zombie_positions"):
+                                india_broker.rescue_zombie_positions(risk_mgr, strategy)
+                            fast_closed = india_broker.check_sl_tp(risk_mgr)
+                            if fast_closed:
+                                logger.info(
+                                    f"[INDIA FAST RISK] Closed via SL/TP: {fast_closed}"
+                                )
+                        except Exception as e:
+                            logger.debug(f"[INDIA FAST RISK] square-off wait skip: {e}")
+                    continue
                 elif india_broker.paper is not None and hasattr(
                     india_broker.paper, "check_intraday_squareoff"
                 ):
@@ -997,6 +1054,8 @@ def run_india_loop(strategy, risk_mgr, rs_filter=None):
                 if not is_india_market_open():
                     continue
                 try:
+                    if hasattr(india_broker, "reconcile_stuck_exits"):
+                        india_broker.reconcile_stuck_exits()
                     if hasattr(india_broker, "rescue_zombie_positions"):
                         india_broker.rescue_zombie_positions(risk_mgr, strategy)
                     fast_closed = india_broker.check_sl_tp(risk_mgr)
