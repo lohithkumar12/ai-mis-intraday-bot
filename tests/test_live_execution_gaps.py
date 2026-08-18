@@ -227,6 +227,82 @@ class TestTrailSyncRetry(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(broker.dhan.modify_super_order.call_count, 2)
 
+    def test_sl_modify_uses_entry_leg(self):
+        broker = DhanBroker.__new__(DhanBroker)
+        broker.paper = None
+        broker.dhan = MagicMock()
+        broker.dhan.modify_order.return_value = {"status": "success"}
+        broker.ensure_session = MagicMock()
+        with patch.object(config, "SYNC_BROKER_STOPS", True), patch.object(
+            config, "SYNC_BROKER_STOP_RETRIES", 1
+        ):
+            ok = broker.sync_broker_stop(
+                "RELIANCE",
+                1321.82,
+                prev_stop=1315.40,
+                sl_order_id="321260818137101",
+                qty=815,
+            )
+        self.assertTrue(ok)
+        kwargs = broker.dhan.modify_order.call_args.kwargs
+        self.assertEqual(kwargs.get("leg_name"), "ENTRY_LEG")
+        self.assertEqual(int(kwargs.get("quantity") or 0), 815)
+        self.assertGreater(float(kwargs.get("trigger_price") or 0), 0)
+
+    def test_super_order_maps_camel_case_target(self):
+        broker = DhanBroker.__new__(DhanBroker)
+        broker.paper = None
+        broker.dhan = MagicMock()
+        broker.ensure_session = MagicMock()
+        broker._assert_live_allowed = MagicMock(return_value=True)
+
+        def sdk_place(
+            security_id,
+            exchange_segment,
+            transaction_type,
+            quantity,
+            order_type,
+            product_type,
+            price,
+            targetPrice,
+            stopLossPrice,
+            trailingJump=0.0,
+        ):
+            self.assertGreater(float(targetPrice), 0)
+            self.assertGreater(float(stopLossPrice), 0)
+            return {"status": "success", "data": {"orderId": "super-99"}}
+
+        broker.dhan.place_super_order = sdk_place
+        with patch("dhan_broker._resolved_security_id", return_value=("2885", "NSE_EQ")):
+            oid = broker.place_super_order(
+                "RELIANCE", 10, 1321.10, 1332.0, 1315.40, product_type="INTRADAY"
+            )
+        self.assertEqual(oid, "super-99")
+
+    def test_super_order_unknown_kwargs_falls_back_to_limit(self):
+        broker = DhanBroker.__new__(DhanBroker)
+        broker.paper = None
+        broker.dhan = MagicMock()
+        broker.ensure_session = MagicMock()
+        broker._assert_live_allowed = MagicMock(return_value=True)
+        broker.place_stoploss_order = MagicMock(return_value="sl-1")
+
+        def sdk_place(security_id, exchange_segment, transaction_type, quantity, price):
+            raise AssertionError("should not be called without target mapping")
+
+        broker.dhan.place_super_order = sdk_place
+        broker.dhan.place_order.return_value = {
+            "status": "success",
+            "data": {"orderId": "limit-1"},
+        }
+        with patch("dhan_broker._resolved_security_id", return_value=("2885", "NSE_EQ")):
+            oid = broker.place_super_order(
+                "RELIANCE", 10, 1321.10, 1332.0, 1315.40, product_type="INTRADAY"
+            )
+        self.assertEqual(oid, "limit-1")
+        broker.dhan.place_order.assert_called()
+        broker.place_stoploss_order.assert_called()
+
 
 class TestIndiaBuyLocked(unittest.TestCase):
     def test_no_ask_qty_blocks(self):

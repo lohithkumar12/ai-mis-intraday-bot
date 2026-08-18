@@ -196,5 +196,35 @@ class TestPortfolioRiskGateAtFull5x(unittest.TestCase):
         self.assertIn("portfolio_risk", why3)
 
 
+class TestMinTrailPctIndependentOfStopFloor(unittest.TestCase):
+    def test_min_stop_pct_does_not_pin_trail_at_breakeven(self):
+        rm = RiskManager(market="INDIA")
+        rm.atr_trail_mult = 0.75
+        entry, sl, peak = 1321.47, 1315.40, 1327.80
+        atr = (entry - sl) / 1.5  # ~4.05 if stop was 1.5x ATR before MIN_STOP floor
+        rm.register_trade("RELIANCE", entry, sl, atr=atr, qty=1125, take_profit=1332.0)
+        with patch.object(config, "MIN_STOP_PCT", 0.0045), patch.object(
+            config, "MIN_TRAIL_PCT", 0.0020
+        ):
+            stop = rm.update_trailing_stop("RELIANCE", peak, atr=atr)
+        # Must sit well above entry (today's bug sat at 1321.82).
+        self.assertGreater(stop, entry + 2.0)
+        self.assertLess(stop, peak)
+
+    def test_two_slot_preset_uses_half_sleeve(self):
+        rm = RiskManager(market="INDIA")
+        rm.risk_per_trade = 0.01125
+        rm.max_position_pct = 2.50
+        price, stop = 1321.10, 6.00
+        with patch.object(config, "INDIA_CAPITAL_CAP", 300_000), patch.object(
+            config, "MAX_SHARES_PER_ORDER", 6000
+        ), patch.object(config, "MIN_STOP_PCT", 0.0045):
+            qty = rm.calculate_position_size(
+                300_000, price, stop_distance=stop, available_cash=300_000
+            )
+        self.assertAlmostEqual(qty, 562, delta=2)
+        self.assertAlmostEqual(qty * price / 5.0, 148_600, delta=2_000)
+
+
 if __name__ == "__main__":
     unittest.main()

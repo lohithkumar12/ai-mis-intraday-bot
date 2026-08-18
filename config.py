@@ -317,6 +317,8 @@ RISK_PER_TRADE: float = _env_float("RISK_PER_TRADE", "0.006")  # 0.6% equity (MI
 MAX_POSITION_PCT: float = _env_float("MAX_POSITION_PCT", "1.00")  # 1.00 = 100% of sleeve (5x MIS notional)
 ATR_STOP_MULT: float = _env_float("ATR_STOP_MULT", "1.2")
 ATR_TRAIL_MULT: float = _env_float("ATR_TRAIL_MULT", "1.2")
+# Independent trail floor (fraction of peak). 0 = ATR-only, do not reuse MIN_STOP_PCT.
+MIN_TRAIL_PCT: float = _env_float("MIN_TRAIL_PCT", "0.0")
 TAKE_PROFIT_R: float = _env_float("TAKE_PROFIT_R", "1.25")  # tighter than CNC swing
 # Legacy pct stops kept as fallback when ATR unavailable
 STOP_LOSS_PCT: float = _env_float("STOP_LOSS_PCT", "0.006")

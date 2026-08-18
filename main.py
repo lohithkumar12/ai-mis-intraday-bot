@@ -297,13 +297,22 @@ def _india_try_buy(
             margin_required = 0.0
     if margin_required <= 0:
         margin_required = (qty * limit_price) / 5.0
-    used = 0.0
-    if hasattr(risk_mgr, "total_margin_used"):
-        try:
-            used = float(risk_mgr.total_margin_used() or 0)
-        except Exception:
-            used = 0.0
-    free = sizing_cash - used
+    if hasattr(risk_mgr, "free_cash_for_entry"):
+        free = float(
+            risk_mgr.free_cash_for_entry(
+                sizing_cash,
+                current_positions,
+                broker_used_margin=account.get("used_margin"),
+            )
+        )
+    else:
+        used = 0.0
+        if hasattr(risk_mgr, "total_margin_used"):
+            try:
+                used = float(risk_mgr.total_margin_used() or 0)
+            except Exception:
+                used = 0.0
+        free = sizing_cash - used
     if margin_required > free:
         logger.info(
             f"[MARGIN REJECTED] {symbol}: needs {margin_required}, free {free}"
@@ -335,8 +344,8 @@ def _india_try_buy(
             stop_loss_price=sl,
             take_profit_price=tp,
             atr=atr,
-            available_cash=sizing_cash,
-            margin_used=used,
+            available_cash=free,
+            margin_used=0.0,
         )
         if not order_id:
             logger.warning(

@@ -94,3 +94,36 @@ class TestLeverageSizing(unittest.TestCase):
             )
         self.assertFalse(ok)
         broker.place_buy_order.assert_not_called()
+
+    def test_free_cash_skips_open_book_when_broker_cash_already_netted(self):
+        """After a fill, Dhan available_cash is already net of blocked margin."""
+        rm = RiskManager(market="INDIA")
+        rm.add_margin("RELIANCE", 297_247)
+        # Next cycle: broker cash ~₹3.8k, local book still 297k.
+        free = rm.free_cash_for_entry(
+            3_844.12,
+            current_positions={"RELIANCE": {"qty": 1125}},
+            broker_used_margin=297_247,
+        )
+        self.assertGreater(free, 0)
+        self.assertLess(free, 5_000)
+
+    def test_same_cycle_still_subtracts_local_book_before_broker_updates(self):
+        rm = RiskManager(market="INDIA")
+        rm.add_margin("RELIANCE", 297_247)
+        free = rm.free_cash_for_entry(
+            300_000,
+            current_positions={"RELIANCE": {"qty": 1125}},
+            broker_used_margin=0,
+        )
+        self.assertAlmostEqual(free, 2_753, delta=1)
+
+    def test_pending_symbol_still_reserves_cash(self):
+        rm = RiskManager(market="INDIA")
+        rm.add_margin("TCS", 140_000)
+        free = rm.free_cash_for_entry(
+            150_000,
+            current_positions={},
+            broker_used_margin=0,
+        )
+        self.assertAlmostEqual(free, 10_000, delta=1)

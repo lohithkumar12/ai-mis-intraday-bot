@@ -193,6 +193,39 @@ class RiskManager:
     def total_margin_used(self) -> float:
         return float(sum((self._margin_by_symbol or {}).values()))
 
+    def free_cash_for_entry(
+        self,
+        available_cash: float,
+        current_positions: dict | None = None,
+        broker_used_margin: float | None = None,
+    ) -> float:
+        """
+        Cash available for a new MIS buy.
+
+        Dhan `available_cash` is already net of blocked margin. Subtracting the
+        local book on top of that double-counts (free went negative after today's
+        RELIANCE fill). Only subtract local bookings that are NOT yet open at
+        the broker (pending / same-cycle), unless broker cash still looks like
+        the pre-block figure.
+        """
+        cash = float(available_cash or 0)
+        book = getattr(self, "_margin_by_symbol", None) or {}
+        open_syms = {str(s).upper() for s in (current_positions or {})}
+        booked_open = 0.0
+        pending = 0.0
+        for sym, amt in book.items():
+            val = float(amt or 0)
+            if str(sym).upper() in open_syms:
+                booked_open += val
+            else:
+                pending += val
+        broker_used = float(broker_used_margin or 0)
+        # Broker already netted (used_margin reported, or cash is clearly below
+        # our open bookings) → trust available_cash; only reserve pending.
+        if broker_used > 1.0 or (booked_open > 0 and cash + 1.0 < booked_open):
+            return cash - pending
+        return cash - (booked_open + pending)
+
     def add_margin(self, symbol: str, amount: float) -> None:
         sym = str(symbol or "").upper()
         if not sym:
@@ -578,17 +611,19 @@ class RiskManager:
         if risk <= 0 or (peak - meta["entry"]) < risk:
             return prev_stop
 
-        min_stop_pct = float(getattr(config, "MIN_STOP_PCT", 0.0) or 0.0)
+        # Trail floor is independent of the entry-stop floor (MIN_STOP_PCT).
+        # Reusing MIN_STOP_PCT pinned the trail at breakeven on 1R days.
+        min_trail_pct = float(getattr(config, "MIN_TRAIL_PCT", 0.0) or 0.0)
         if use_atr and use_atr > 0:
             trail_dist = self.atr_trail_mult * use_atr
-            if min_stop_pct > 0:
-                trail_dist = max(trail_dist, peak * min_stop_pct)
-            trail = round(peak - trail_dist, 2)
+            if min_trail_pct > 0:
+                trail_dist = max(trail_dist, peak * min_trail_pct)
+            trail = _round_px(self.market, peak - trail_dist, mode="floor")
         else:
             trail_pct = self.stop_loss_pct
-            if min_stop_pct > 0:
-                trail_pct = max(trail_pct, min_stop_pct)
-            trail = round(peak * (1 - trail_pct), 2)
+            if min_trail_pct > 0:
+                trail_pct = max(trail_pct, min_trail_pct)
+            trail = _round_px(self.market, peak * (1 - trail_pct), mode="floor")
 
         # Never loosen vs initial OR vs already-ratcheted stop
         effective = max(initial_stop, prev_stop, trail)

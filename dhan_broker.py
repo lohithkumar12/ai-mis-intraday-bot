@@ -20,6 +20,7 @@ Env (see config.py):
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -66,6 +67,23 @@ _BRACKET_PENDING_STATUSES = frozenset(
 )
 BRACKET_CANCEL_TIMEOUT_SEC = 1.5
 BRACKET_CANCEL_POLL_SEC = 0.1
+
+
+def _dhan_invoke(method, *, require_any: tuple[str, ...] = (), **kwargs):
+    """Call a Dhan SDK method with only the kwargs its signature accepts."""
+    if method is None:
+        raise TypeError("dhan method is None")
+    try:
+        sig = inspect.signature(method)
+    except (TypeError, ValueError):
+        return method(**kwargs)
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return method(**kwargs)
+    filtered = {k: v for k, v in kwargs.items() if k in params}
+    if require_any and not any(k in filtered for k in require_any):
+        raise TypeError(f"SDK does not accept any of {require_any}")
+    return method(**filtered)
 
 
 def _dhan_product_type(product_type: str | None = None):
@@ -3015,12 +3033,15 @@ class DhanBroker:
         for attempt in range(1, retries + 1):
             try:
                 if super_order_id and hasattr(self.dhan, "modify_super_order"):
-                    resp = self.dhan.modify_super_order(
+                    resp = _dhan_invoke(
+                        self.dhan.modify_super_order,
                         order_id=str(super_order_id),
                         order_type=getattr(dhanhq, "LIMIT", "LIMIT"),
                         leg_name="STOP_LOSS_LEG",
                         stopLossPrice=float(new_stop),
+                        stop_loss_price=float(new_stop),
                         trailingJump=0.0,
+                        trailing_jump=0.0,
                     )
                     ok = self._ok(resp) if hasattr(self, "_ok") else True
                     if ok:
@@ -3037,10 +3058,23 @@ class DhanBroker:
                     trigger = float(new_stop)
                     limit_px = float(round_sell_limit(trigger * 0.995))
                     q = int(qty or 0)
-                    resp = self.dhan.modify_order(
+                    if q <= 0:
+                        logger.warning(
+                            f"{symbol}: skip broker SL sync — qty={q} (DH-905 if sent)"
+                        )
+                        return False
+                    # Dhan v2: modifying a resting SL needs ENTRY_LEG, not "".
+                    # Empty leg_name was today's DH-905 on every trail sync.
+                    sl_type = (
+                        getattr(dhanhq, "SL", None)
+                        or getattr(dhanhq, "STOP_LOSS", None)
+                        or "STOP_LOSS"
+                    )
+                    resp = _dhan_invoke(
+                        self.dhan.modify_order,
                         order_id=str(sl_order_id),
-                        order_type=getattr(dhanhq, "SL", "SL"),
-                        leg_name="",
+                        order_type=sl_type,
+                        leg_name="ENTRY_LEG",
                         quantity=q,
                         price=limit_px,
                         trigger_price=trigger,
@@ -3558,21 +3592,52 @@ class DhanBroker:
             return None
 
         try:
-            method = getattr(self.dhan, "place_super_order", None) or getattr(self.dhan, "place_slice_order", None)
+            method = getattr(self.dhan, "place_super_order", None)
             if method:
-                raw = method(
+                tx = getattr(dhanhq, transaction_type.upper(), dhanhq.BUY)
+                common = dict(
                     security_id=str(sec_id),
                     exchange_segment=exch_seg,
-                    transaction_type=getattr(dhanhq, transaction_type.upper(), dhanhq.BUY),
+                    transaction_type=tx,
                     quantity=int(qty),
                     order_type=dhanhq.LIMIT,
                     product_type=dhan_ptype,
                     price=float(limit_price),
-                    target_price=float(target_price),
-                    stop_loss_price=float(stop_loss_price),
-                    trailing_jump=float(trailing_jump),
                 )
-                oid = self._extract_order_id(raw)
+                # Installed SDK versions disagree on snake vs camel target/SL names.
+                attempts = (
+                    dict(
+                        target_price=float(target_price),
+                        stop_loss_price=float(stop_loss_price),
+                        trailing_jump=float(trailing_jump),
+                    ),
+                    dict(
+                        targetPrice=float(target_price),
+                        stopLossPrice=float(stop_loss_price),
+                        trailingJump=float(trailing_jump),
+                    ),
+                )
+                raw = None
+                for extra in attempts:
+                    try:
+                        raw = _dhan_invoke(
+                            method,
+                            require_any=(
+                                "target_price",
+                                "targetPrice",
+                                "stop_loss_price",
+                                "stopLossPrice",
+                            ),
+                            **common,
+                            **extra,
+                        )
+                        break
+                    except TypeError as te:
+                        logger.info(
+                            f"{symbol}: Super Order kwargs not accepted ({te}) — trying next mapping"
+                        )
+                        raw = None
+                oid = self._extract_order_id(raw) if raw is not None else None
                 if oid:
                     logger.warning(f"LIVE SUPER ORDER placed | {symbol} | Product={p_type} | ID={oid}")
                     return oid

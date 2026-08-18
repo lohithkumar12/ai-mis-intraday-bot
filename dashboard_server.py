@@ -944,6 +944,8 @@ def close_india_position(symbol):
     india_risk = get_india_risk()
     if india_risk:
         india_risk.clear_trade(symbol)
+        if hasattr(india_risk, "release_margin"):
+            india_risk.release_margin(symbol)
 
     acct = india_broker.get_account_info() or {}
     equity = float(acct.get("equity") or 0)
@@ -1325,6 +1327,8 @@ def close_us_position(symbol):
     us_risk = get_us_risk()
     if us_risk:
         us_risk.clear_trade(symbol)
+        if hasattr(us_risk, "release_margin"):
+            us_risk.release_margin(symbol)
 
     acct = us_broker.get_account_info() or {}
     equity = float(acct.get("equity") or 0)
