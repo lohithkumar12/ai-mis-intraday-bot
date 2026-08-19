@@ -342,7 +342,7 @@ ORDER_CONFIRM_TIMEOUT_SEC: float = _env_float("ORDER_CONFIRM_TIMEOUT_SEC", "8")
 
 # Avoid first/last N minutes of the session (noise / poor fills)
 # MIS: skip open noise while OR builds; last ~75m ≈ no new entries after ~14:15
-AVOID_OPEN_MINUTES: int = _env_int("AVOID_OPEN_MINUTES", "15")
+AVOID_OPEN_MINUTES: int = _env_int("AVOID_OPEN_MINUTES", "0")
 AVOID_CLOSE_MINUTES: int = _env_int("AVOID_CLOSE_MINUTES", "75")
 ALLOW_OPEN_CLOSE_WINDOW: bool = _env_bool("ALLOW_OPEN_CLOSE_WINDOW", "false")
 # Hard MIS entry cutoff HH:MM IST (no NEW entries after this, even if avoid-close allows)

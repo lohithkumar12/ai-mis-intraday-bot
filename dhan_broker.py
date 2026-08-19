@@ -167,6 +167,73 @@ MARKETFEED_COOLDOWN_SEC = 90.0
 # Chunk intraday history requests (API can reject very wide ranges).
 INTRADAY_CHUNK_DAYS = 30
 
+
+# ---------------------------------------------------------------------------
+# Shared rate limiter — at most MAX_RPS Dhan API calls/second across all
+# code paths.  On DH-904 / HTTP 429, back off exponentially (0.5→1→2→…8s).
+# ---------------------------------------------------------------------------
+MAX_RPS = 8
+_BACKOFF_BASE = 0.5
+_BACKOFF_MAX = 8.0
+
+
+class _DhanRateLimiter:
+    """Process-wide token-bucket rate limiter for all Dhan REST calls."""
+
+    def __init__(self, max_rps: int = MAX_RPS):
+        self._lock = threading.Lock()
+        self._tokens = float(max_rps)
+        self._max_tokens = float(max_rps)
+        self._last_refill = time.monotonic()
+        self._backoff = 0.0
+        self._dh904_burst_logged = False
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self._max_tokens, self._tokens + elapsed * self._max_tokens)
+        self._last_refill = now
+
+    def acquire(self) -> None:
+        """Block until a token is available (respects backoff)."""
+        while True:
+            with self._lock:
+                if self._backoff > 0:
+                    wait = self._backoff
+                    self._backoff = 0.0
+                else:
+                    wait = 0.0
+            if wait > 0:
+                time.sleep(wait)
+            with self._lock:
+                self._refill()
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+            time.sleep(1.0 / self._max_tokens)
+
+    def report_rate_limit(self) -> None:
+        """Called on DH-904 / 429 — apply exponential backoff."""
+        with self._lock:
+            if self._backoff <= 0:
+                self._backoff = _BACKOFF_BASE
+            else:
+                self._backoff = min(self._backoff * 2, _BACKOFF_MAX)
+            if not self._dh904_burst_logged:
+                self._dh904_burst_logged = True
+                logger.warning(
+                    "[RATE LIMIT] DH-904 / 429 detected — backing off %.1fs",
+                    self._backoff,
+                )
+
+    def reset_burst_flag(self) -> None:
+        with self._lock:
+            self._dh904_burst_logged = False
+
+
+_rate_limiter = _DhanRateLimiter()
+
+
 TOKEN_CACHE_PATH = Path(
     os.getenv(
         "DHAN_TOKEN_CACHE_PATH",
@@ -399,6 +466,8 @@ class DhanBroker:
 
     def _handle_api_error(self, context: str, err) -> bool:
         msg = str(err).lower()
+        if "429" in msg or "dh-904" in msg or "rate limit" in msg or "too many" in msg:
+            _rate_limiter.report_rate_limit()
         if any(
             k in msg
             for k in ("token", "unauthorized", "401", "auth", "expired", "invalid")
@@ -451,6 +520,7 @@ class DhanBroker:
         if not self.dhan:
             return None
         try:
+            _rate_limiter.acquire()
             resp = self.dhan.get_fund_limits()
             data = self._data(resp) if self._ok(resp) else None
             if not isinstance(data, dict):
@@ -583,6 +653,7 @@ class DhanBroker:
     # Historical bars
     # -----------------------------------------------------------------------
     def _throttle_candles(self) -> None:
+        _rate_limiter.acquire()
         now_ts = time.time()
         gap = now_ts - self._last_candle_call_time
         if gap < CANDLE_CALL_GAP_SEC:
@@ -1032,6 +1103,7 @@ class DhanBroker:
             if method is None:
                 return self._quote_from_candle_cache(symbol)
 
+            _rate_limiter.acquire()
             resp = method(securities)
             status_code = None
             if isinstance(resp, dict):
@@ -1042,6 +1114,7 @@ class DhanBroker:
             if not self._ok(resp):
                 raw = str(resp).lower()
                 if "429" in raw or status_code in (429, "429", "DH-904"):
+                    _rate_limiter.report_rate_limit()
                     self._arm_marketfeed_cooldown("HTTP 429 rate limit")
                 elif "401" in raw or status_code in (401, "401", "DH-901"):
                     self._arm_marketfeed_cooldown("HTTP 401 / auth")
@@ -1559,15 +1632,21 @@ class DhanBroker:
             )
             if adopted:
                 return True, adopt_status
+            resolved_status = adopt_status or last_status or "PENDING"
             logger.warning(
-                f"{symbol}: order {order_id} still {adopt_status or last_status or 'PENDING'} "
+                f"{symbol}: order {order_id} still {resolved_status} "
                 f"after {timeout:.0f}s — cancelled leftover; NOT treating as fill"
             )
-            order_guards.block_buy_after_pending(symbol, order_id)
+            if resolved_status == "PENDING_CANCELLED":
+                # Clean cancel with zero fill — clear the guard immediately
+                # so the bot can retry on the next cycle instead of waiting 90s.
+                order_guards.clear_buy_block(symbol)
+            else:
+                order_guards.block_buy_after_pending(symbol, order_id)
             self._set_sl_tp_status(symbol, "COOLDOWN", order_id=order_id)
-            self.last_error = f"pending:{adopt_status or last_status or 'PENDING'}"
-            self.last_order_status = adopt_status or last_status or "PENDING"
-            return False, adopt_status or last_status or "PENDING"
+            self.last_error = f"pending:{resolved_status}"
+            self.last_order_status = resolved_status
+            return False, resolved_status
 
         if last_status in _REJECT_STATUSES:
             order_guards.block_buy_after_reject(symbol, last_detail)
@@ -2180,6 +2259,7 @@ class DhanBroker:
         mis_mode = _trading_product_is_mis()
 
         try:
+            _rate_limiter.acquire()
             resp = self.dhan.get_positions()
             if not self._ok(resp):
                 self.last_error = f"Dhan positions API failed: {resp}"
@@ -2889,11 +2969,22 @@ class DhanBroker:
         try:
             self._cancel_and_verify_brackets(symbol)
 
-            # Fresh snapshot AFTER cancel — never sell on a pre-cancel netQty.
-            positions = self.get_open_positions()
-            if positions is None:
-                logger.warning(f"{symbol}: skip close — positions snapshot unavailable")
-                return None
+            # Poll positions until netQty stabilises (two consecutive reads
+            # agree) so a partial fill still in flight doesn't cause a qty
+            # mismatch on the flatten SELL.  Max 3 extra polls, 0.5s apart.
+            prev_qty = None
+            positions = None
+            for _poll in range(4):
+                positions = self.get_open_positions()
+                if positions is None:
+                    logger.warning(f"{symbol}: skip close — positions snapshot unavailable")
+                    return None
+                cur_qty = int((positions.get(symbol) or {}).get("qty") or 0)
+                if prev_qty is not None and cur_qty == prev_qty:
+                    break
+                prev_qty = cur_qty
+                if _poll < 3:
+                    time.sleep(0.5)
             if symbol not in positions:
                 logger.warning(
                     f"{symbol}: skip SELL — netQty=0 after cancel-verify "
@@ -3803,12 +3894,15 @@ class DhanBroker:
     @staticmethod
     def _is_rate_limit_err(err: str) -> bool:
         msg = str(err or "").upper()
-        return (
+        hit = (
             "429" in msg
             or "DH-904" in msg
             or "RATE LIMIT" in msg
             or "TOO MANY REQUESTS" in msg
         )
+        if hit:
+            _rate_limiter.report_rate_limit()
+        return hit
 
     def square_off_all_positions(self) -> list[str]:
         return self.square_off_intraday_positions()
