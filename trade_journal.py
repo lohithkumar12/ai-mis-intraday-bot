@@ -133,6 +133,7 @@ def record_exit(
     exit_price: float,
     reason: str = "",
     qty: int | None = None,
+    broker_pnl: float | None = None,
 ) -> Optional[dict]:
     """Close the most recent open trade for symbol/market. Returns closed row dict."""
     try:
@@ -172,11 +173,14 @@ def record_exit(
         q = int(qty if qty is not None else row["qty"])
         side = str(row["side"] or "BUY").upper()
         if side == "SELL":
-            pnl = (entry - px) * q
+            computed_pnl = (entry - px) * q
             pnl_pct = ((entry - px) / entry) if entry else 0.0
         else:
-            pnl = (px - entry) * q
+            computed_pnl = (px - entry) * q
             pnl_pct = ((px - entry) / entry) if entry else 0.0
+        pnl = broker_pnl if broker_pnl is not None else computed_pnl
+        if broker_pnl is not None and entry > 0 and q > 0:
+            pnl_pct = pnl / (entry * q)
         entry_reason = row["reason"] or ""
         try:
             meta = json.loads(row["meta_json"] or "{}")
@@ -405,12 +409,14 @@ def reconcile_broker_flats(
     broker_open_symbols: set[str] | list[str] | None,
     *,
     price_lookup,
+    pnl_lookup=None,
     reason: str = "broker_flat",
 ) -> list[str]:
     """
     Journal-exit any open trade whose symbol is no longer in broker open positions
     (broker SL/TP, manual close on Dhan, etc.).
     price_lookup(symbol) -> float exit mark (prefer broker fill, then LTP).
+    pnl_lookup(symbol) -> float|None broker realised P&L (optional).
     Does NOT fall back to entry (that falsely journals +0 PnL).
     """
     open_syms = {str(s).upper() for s in (broker_open_symbols or [])}
@@ -428,7 +434,13 @@ def reconcile_broker_flats(
                 f"[JOURNAL] skip broker_flat {market} {symbol}: no usable exit price"
             )
             continue
-        out = record_exit(market, symbol, px, reason=reason)
+        bpnl = None
+        if pnl_lookup is not None:
+            try:
+                bpnl = pnl_lookup(symbol)
+            except Exception:
+                pass
+        out = record_exit(market, symbol, px, reason=reason, broker_pnl=bpnl)
         if out:
             closed.append(symbol)
             logger.warning(

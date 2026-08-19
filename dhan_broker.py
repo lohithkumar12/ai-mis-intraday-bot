@@ -1583,6 +1583,19 @@ class DhanBroker:
                 order_guards.block_buy_after_reject(symbol, last_detail)
                 return False, msg
             if last_status in _FILL_STATUSES:
+                # PART_TRADED: keep polling up to 10s for the order to reach
+                # TRADED so we journal the final fill qty, not an interim slice.
+                if last_status == "PART_TRADED":
+                    settle_deadline = time.time() + 10.0
+                    while time.time() < settle_deadline:
+                        time.sleep(1.0)
+                        st, _ = self.get_order_status(order_id)
+                        if st == "TRADED" or st == "COMPLETE" or st == "COMPLETED":
+                            last_status = st
+                            break
+                        if st in _REJECT_STATUSES:
+                            break
+
                 filled_qty = self.get_order_filled_qty(order_id)
                 self.last_fill_qty = int(filled_qty) if filled_qty > 0 else int(
                     getattr(self, "last_fill_qty", 0) or 0
@@ -2338,6 +2351,9 @@ class DhanBroker:
             logger.error(f"Dhan positions error: {e}", exc_info=True)
             return None
 
+        # Cache the full raw positions payload for realised P&L lookups on closed rows.
+        self._last_raw_positions = data or []
+
         # CNC sleeve may still show overnight holdings as exposure.
         # MIS bots must not — holdings would block new ORB entries and confuse SL/square-off.
         if not mis_mode:
@@ -2397,6 +2413,33 @@ class DhanBroker:
             self._backfill_zero_ltp_from_quotes(pos_dict)
             logger.info(f"India open positions: {list(pos_dict.keys())}")
         return pos_dict
+
+    def get_closed_position_pnl(self, symbol: str) -> float | None:
+        """Return Dhan's realised P&L for a closed position (netQty=0), or None."""
+        token_to_symbol = {
+            info["token"]: sym for sym, info in INDIA_INSTRUMENTS.items()
+        }
+        want = str(symbol).upper()
+        for pos in getattr(self, "_last_raw_positions", None) or []:
+            if not isinstance(pos, dict):
+                continue
+            net_qty = int(float(pos.get("netQty") or pos.get("net_qty") or pos.get("quantity") or 0))
+            if net_qty != 0:
+                continue
+            sec_id = str(pos.get("securityId") or pos.get("security_id") or "")
+            tsym = str(
+                pos.get("tradingSymbol") or pos.get("trading_symbol") or pos.get("symbol") or ""
+            ).replace("-EQ", "")
+            resolved = token_to_symbol.get(sec_id) or tsym
+            if resolved.upper() != want:
+                continue
+            rpnl = pos.get("realizedProfit") or pos.get("realisedProfit") or pos.get("dayPnl") or pos.get("pnl")
+            if rpnl is not None:
+                try:
+                    return float(rpnl)
+                except (TypeError, ValueError):
+                    pass
+        return None
 
     # -----------------------------------------------------------------------
     # Orders
@@ -3592,6 +3635,59 @@ class DhanBroker:
                     except Exception as je:
                         logger.debug(f"Journal exit skip: {je}")
 
+        # Detect bracket SL / broker-side exits: tracked positions that
+        # vanished from broker positions since last check.
+        try:
+            import trade_journal as _tj
+
+            tracked = set((getattr(self, "sl_tp_meta", None) or {}).keys())
+            tracked |= set((getattr(risk_mgr, "_trade_meta", None) or {}).keys())
+            broker_open = set(positions.keys())
+            vanished = tracked - broker_open
+            for sym in vanished:
+                if not sym:
+                    continue
+                # Only act if journal still has an open row for this symbol
+                open_rows = _tj.list_open_trades("INDIA")
+                if not any(str(r.get("symbol") or "").upper() == sym for r in open_rows):
+                    continue
+                exit_px = 0.0
+                try:
+                    exit_px = float(self.latest_sell_fill_price(sym) or 0)
+                except Exception:
+                    pass
+                if exit_px <= 0:
+                    q = self.get_latest_quote(sym)
+                    if q and q.get("ltp"):
+                        exit_px = float(q["ltp"])
+                if exit_px <= 0:
+                    logger.warning(
+                        f"[BRACKET EXIT] {sym}: vanished from broker but no usable exit price"
+                    )
+                    continue
+                bpnl = None
+                try:
+                    bpnl = self.get_closed_position_pnl(sym)
+                except Exception:
+                    pass
+                out = _tj.record_exit("INDIA", sym, exit_px, reason="bracket_sl", broker_pnl=bpnl)
+                if out:
+                    logger.warning(
+                        f"[BRACKET EXIT] {sym}: journaled broker-side exit @ {exit_px:.2f}"
+                    )
+                    closed_symbols.append(sym)
+                    risk_mgr.clear_trade(sym)
+                    try:
+                        risk_mgr.release_margin(sym)
+                    except Exception:
+                        pass
+                    meta_map = getattr(self, "sl_tp_meta", None)
+                    if isinstance(meta_map, dict):
+                        meta_map.pop(sym, None)
+                        self.save_sl_tp_meta()
+        except Exception as be:
+            logger.debug(f"[BRACKET EXIT] detection skip: {be}")
+
         return closed_symbols
 
     def cancel_all_open_orders(self) -> bool:
@@ -3686,7 +3782,8 @@ class DhanBroker:
             method = getattr(self.dhan, "place_super_order", None)
             if method:
                 tx = getattr(dhanhq, transaction_type.upper(), dhanhq.BUY)
-                common = dict(
+                _rate_limiter.acquire()
+                raw = method(
                     security_id=str(sec_id),
                     exchange_segment=exch_seg,
                     transaction_type=tx,
@@ -3694,40 +3791,10 @@ class DhanBroker:
                     order_type=dhanhq.LIMIT,
                     product_type=dhan_ptype,
                     price=float(limit_price),
+                    targetPrice=float(target_price),
+                    stopLossPrice=float(stop_loss_price),
+                    trailingJump=float(trailing_jump),
                 )
-                # Installed SDK versions disagree on snake vs camel target/SL names.
-                attempts = (
-                    dict(
-                        target_price=float(target_price),
-                        stop_loss_price=float(stop_loss_price),
-                        trailing_jump=float(trailing_jump),
-                    ),
-                    dict(
-                        targetPrice=float(target_price),
-                        stopLossPrice=float(stop_loss_price),
-                        trailingJump=float(trailing_jump),
-                    ),
-                )
-                raw = None
-                for extra in attempts:
-                    try:
-                        raw = _dhan_invoke(
-                            method,
-                            require_any=(
-                                "target_price",
-                                "targetPrice",
-                                "stop_loss_price",
-                                "stopLossPrice",
-                            ),
-                            **common,
-                            **extra,
-                        )
-                        break
-                    except TypeError as te:
-                        logger.info(
-                            f"{symbol}: Super Order kwargs not accepted ({te}) — trying next mapping"
-                        )
-                        raw = None
                 oid = self._extract_order_id(raw) if raw is not None else None
                 if oid:
                     logger.warning(f"LIVE SUPER ORDER placed | {symbol} | Product={p_type} | ID={oid}")

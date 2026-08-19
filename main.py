@@ -640,8 +640,13 @@ def _india_try_sell(
             current_positions.pop(symbol, None)
             return True
         qty = int(getattr(india_broker, "last_fill_qty", 0) or pos.get("qty") or 0) or None
+        bpnl = None
+        try:
+            bpnl = india_broker.get_closed_position_pnl(symbol)
+        except Exception:
+            pass
         trade_journal.record_exit(
-            "INDIA", symbol, px, reason="signal_sell", qty=qty
+            "INDIA", symbol, px, reason="signal_sell", qty=qty, broker_pnl=bpnl
         )
         risk_mgr.clear_trade(symbol)
         risk_mgr.release_margin(symbol)
@@ -674,10 +679,17 @@ def _reconcile_india_journal(india_broker, risk_mgr, current_positions: dict) ->
                 return float(q["ltp"])
             return 0.0
 
+        def _bpnl(sym: str) -> float | None:
+            try:
+                return india_broker.get_closed_position_pnl(sym)
+            except Exception:
+                return None
+
         closed = trade_journal.reconcile_broker_flats(
             "INDIA",
             set((current_positions or {}).keys()),
             price_lookup=_px,
+            pnl_lookup=_bpnl,
             reason="broker_flat",
         )
         for sym in closed:
