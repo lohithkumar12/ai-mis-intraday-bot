@@ -381,7 +381,9 @@ BUY_RESERVE_TTL_SEC: float = _env_float("BUY_RESERVE_TTL_SEC", "45")
 
 # Multi-timeframe / regime — softer defaults for MIS ORB (optional)
 USE_MTF_FILTER: bool = _env_bool("USE_MTF_FILTER", "false")
-USE_REGIME_FILTER: bool = _env_bool("USE_REGIME_FILTER", "false")
+# RELIANCE SMA-200 overlay removed. Per-stock mis_regime + Nifty/BankNifty tide remain.
+# Env USE_REGIME_FILTER is ignored so a leftover true on the VM cannot block all buys.
+USE_REGIME_FILTER: bool = False
 REGIME_SYMBOL_INDIA: str = os.getenv("REGIME_SYMBOL_INDIA", "RELIANCE").strip().upper()
 
 # Nifty / BankNifty 5m "tide" circuit breaker — blocks new longs only (no flatten)
