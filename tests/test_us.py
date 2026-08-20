@@ -128,6 +128,34 @@ class TestUSBrokerSafety(unittest.TestCase):
             self.assertEqual(order_id, "US-SELL-9")
             self.assertTrue(broker.dhan.place_global_order.called)
 
+    def test_live_account_info_reads_available_cash(self):
+        with patch.object(config, "US_LIVE_CONFIRMED", True), \
+             patch.object(config, "US_PAPER", False):
+            broker = USBroker(auto_login=False)
+            broker.paper = None
+            broker._global_stocks_available = True
+            broker._logged_in = True
+            broker.dhan = MagicMock()
+            broker.dhan.get_global_fund_limit.return_value = {
+                "status": "success",
+                "remarks": "",
+                "data": {
+                    "dhanClientId": "1112996229",
+                    "availableCash": 500.0,
+                    "cashOnAccount": 500.0,
+                    "actualCash": 500.0,
+                    "settledCash": 0.0,
+                    "unsettledCash": 0.0,
+                    "marginUtilized": 0.0,
+                },
+            }
+            with patch.object(broker, "ensure_session"):
+                info = broker.get_account_info()
+            self.assertIsNotNone(info)
+            self.assertEqual(info["available_cash"], 500.0)
+            self.assertEqual(info["equity"], 500.0)
+            self.assertEqual(info["buying_power"], 500.0)
+
 
 class TestUSLiveFeed(unittest.TestCase):
     def test_feed_connected_only_after_tick(self):

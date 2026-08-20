@@ -373,8 +373,14 @@ class USBroker:
                     return None
                 data = resp if isinstance(resp, dict) else {}
 
+            # Dhan Global fundlimit shape (live probe):
+            #   availableCash / cashOnAccount / actualCash / marginUtilized
+            # India-style keys kept as fallbacks.
             available_cash = float(
-                data.get("availabelBalance")
+                data.get("availableCash")
+                or data.get("cashOnAccount")
+                or data.get("actualCash")
+                or data.get("availabelBalance")  # India typo key
                 or data.get("availableBalance")
                 or data.get("balance")
                 or data.get("sodLimit")
@@ -383,10 +389,23 @@ class USBroker:
             buying_power = float(
                 data.get("buyingPower")
                 or data.get("buying_power")
+                or data.get("availableCash")
                 or available_cash
             )
-            used_margin = float(data.get("utilizedAmount") or data.get("usedMargin") or 0)
-            net = available_cash + used_margin
+            used_margin = float(
+                data.get("marginUtilized")
+                or data.get("utilizedAmount")
+                or data.get("usedMargin")
+                or 0
+            )
+            # Prefer cash-on-account as book equity when no positions MTM here
+            cash_on_account = float(
+                data.get("cashOnAccount")
+                or data.get("actualCash")
+                or available_cash
+                or 0
+            )
+            net = cash_on_account if cash_on_account > 0 else (available_cash + used_margin)
 
             info = {
                 "equity": round(net, 2) if net > 0 else round(available_cash, 2),
@@ -395,10 +414,12 @@ class USBroker:
                 "used_margin": round(used_margin, 2),
                 "net": round(net, 2),
                 "paper": False,
+                "settled_cash": float(data.get("settledCash") or 0),
+                "unsettled_cash": float(data.get("unsettledCash") or 0),
             }
             logger.info(
                 f"[US LIVE] Net=${net:,.2f} | Cash=${available_cash:,.2f} | "
-                f"BuyPower=${buying_power:,.2f}"
+                f"BuyPower=${buying_power:,.2f} | MarginUsed=${used_margin:,.2f}"
             )
             return info
         except Exception as e:
