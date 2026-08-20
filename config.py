@@ -452,6 +452,10 @@ US_PAPER_STARTING_CASH: float = _env_float("US_PAPER_STARTING_CASH", "500")
 # Keep at funded wallet size; bump to 1000 after the second $500 deposit.
 US_CAPITAL_CAP: float = _env_float("US_CAPITAL_CAP", "500")
 
+# US session gates (America/New_York). Do NOT reuse India IST ENTRY_CUTOFF.
+# NYSE RTH ends 16:00 ET; leave buffer before close (AVOID_CLOSE still applies).
+US_ENTRY_CUTOFF: str = os.getenv("US_ENTRY_CUTOFF", "15:15").strip()
+
 # US cash risk overrides (India MIS leverage must NOT apply here).
 US_RISK_PER_TRADE: float = _env_float("US_RISK_PER_TRADE", "0.01")  # 1% of sleeve (~$5 on $500)
 US_MAX_POSITION_PCT: float = _env_float("US_MAX_POSITION_PCT", "0.80")  # max 80% cash per name

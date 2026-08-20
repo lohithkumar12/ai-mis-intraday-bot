@@ -165,8 +165,37 @@ def _ist_tz():
         return pytz.timezone("Asia/Kolkata")
 
 
+def _et_tz():
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo("America/New_York")
+    except ImportError:
+        import pytz  # type: ignore
+
+        return pytz.timezone("America/New_York")
+
+
 def now_ist() -> datetime:
     return datetime.now(_ist_tz())
+
+
+def now_et() -> datetime:
+    return datetime.now(_et_tz())
+
+
+def market_now(market: str) -> datetime:
+    """Local clock for the given market (IST for India, ET for US)."""
+    if str(market or "").upper() == "US":
+        return now_et()
+    return now_ist()
+
+
+def entry_cutoff_for_market(market: str) -> str:
+    """HH:MM cutoff string for the market's local clock."""
+    if str(market or "").upper() == "US":
+        return str(getattr(config, "US_ENTRY_CUTOFF", "") or "").strip()
+    return str(getattr(config, "ENTRY_CUTOFF", "") or "").strip()
 
 
 def timeframe_minutes() -> int:
@@ -279,15 +308,29 @@ def in_open_drive_window(
     return open_m <= mins < open_m + int(window_minutes)
 
 
-def past_entry_cutoff(now: datetime | None = None) -> bool:
-    """True when local time >= ENTRY_CUTOFF (HH:MM). No new BUYs after this."""
+def past_entry_cutoff(
+    now: datetime | None = None,
+    *,
+    market: str | None = None,
+    cutoff: str | None = None,
+) -> bool:
+    """
+    True when local time >= entry cutoff (HH:MM). No new BUYs after this.
+
+    For US, pass market="US" (or cutoff=US_ENTRY_CUTOFF) and an ET `now`.
+    India defaults: IST now + ENTRY_CUTOFF.
+    """
+    raw = cutoff
+    if raw is None and market is not None:
+        raw = entry_cutoff_for_market(market)
+    if raw is None:
+        raw = getattr(config, "ENTRY_CUTOFF", "") or ""
     if now is None:
-        now = now_ist()
-    raw = getattr(config, "ENTRY_CUTOFF", "") or ""
-    if not raw or ":" not in raw:
+        now = market_now(market or "INDIA")
+    if not raw or ":" not in str(raw):
         return False
     try:
-        hh, mm = raw.split(":")[:2]
+        hh, mm = str(raw).split(":")[:2]
         cut = int(hh) * 60 + int(mm)
     except Exception:
         return False
@@ -1415,7 +1458,9 @@ class MisRegimeStrategy(BaseStrategy):
             logger.error(f"{symbol}: TEST_MODE on — refusing signal.")
             return self._record(symbol, PLAYBOOK_NONE, PLAYBOOK_NONE, "HOLD", "test_mode", [])
 
-        now = now_ist()
+        market = str(getattr(self.p, "market", "INDIA") or "INDIA").upper()
+        now = market_now(market)
+        cutoff_raw = entry_cutoff_for_market(market)
         if df is None or df.empty:
             return self._record(symbol, PLAYBOOK_NONE, PLAYBOOK_NONE, "HOLD", "no_data", [])
 
@@ -1443,13 +1488,14 @@ class MisRegimeStrategy(BaseStrategy):
             evaluations.append({"playbook": playbook, "signal": sig, "reason": why})
             return sig
 
-        if past_entry_cutoff(now):
+        if past_entry_cutoff(now, market=market, cutoff=cutoff_raw):
+            label = "US_ENTRY_CUTOFF" if market == "US" else "ENTRY_CUTOFF"
             return self._record(
                 symbol,
                 regime,
                 PLAYBOOK_NONE,
                 "HOLD",
-                f"past ENTRY_CUTOFF={config.ENTRY_CUTOFF}",
+                f"past {label}={cutoff_raw}",
                 evaluations,
                 ts=ts,
             )

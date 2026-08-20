@@ -675,11 +675,13 @@ class RiskManager:
         `now` should already be in the market's local timezone.
         """
         if config.ALLOW_OPEN_CLOSE_WINDOW:
-            # Still honor hard MIS entry cutoff even if avoid windows are disabled
+            # Still honor hard entry cutoff even if avoid windows are disabled
             if now is None:
                 now = datetime.now()
             if self._past_entry_cutoff(now):
-                logger.info(f"[{self.market}] Skipping — past ENTRY_CUTOFF={config.ENTRY_CUTOFF}")
+                cut = self._entry_cutoff_str()
+                label = "US_ENTRY_CUTOFF" if self.market == "US" else "ENTRY_CUTOFF"
+                logger.info(f"[{self.market}] Skipping — past {label}={cut}")
                 return False
             return True
 
@@ -703,13 +705,19 @@ class RiskManager:
             )
             return False
         if self._past_entry_cutoff(now):
-            logger.info(f"[{self.market}] Skipping — past ENTRY_CUTOFF={config.ENTRY_CUTOFF}")
+            cut = self._entry_cutoff_str()
+            label = "US_ENTRY_CUTOFF" if self.market == "US" else "ENTRY_CUTOFF"
+            logger.info(f"[{self.market}] Skipping — past {label}={cut}")
             return False
         return True
 
-    @staticmethod
-    def _past_entry_cutoff(now: datetime) -> bool:
-        raw = getattr(config, "ENTRY_CUTOFF", "") or ""
+    def _entry_cutoff_str(self) -> str:
+        if self.market == "US":
+            return str(getattr(config, "US_ENTRY_CUTOFF", "") or "").strip()
+        return str(getattr(config, "ENTRY_CUTOFF", "") or "").strip()
+
+    def _past_entry_cutoff(self, now: datetime) -> bool:
+        raw = self._entry_cutoff_str()
         if not raw or ":" not in raw:
             return False
         try:

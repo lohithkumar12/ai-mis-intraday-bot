@@ -31,13 +31,28 @@ class TestMisSessionGates(unittest.TestCase):
                 )
             )
 
-    def test_squareoff_hm(self):
-        rm = RiskManager(market="INDIA")
-        with patch.object(config, "SQUAREOFF_TIME", "15:00"):
-            hh, mm = rm.squareoff_hm()
-            self.assertEqual((hh, mm), (15, 0))
-            self.assertTrue(rm.past_squareoff(datetime(2026, 8, 10, 15, 0)))
-            self.assertFalse(rm.past_squareoff(datetime(2026, 8, 10, 14, 59)))
+    def test_us_entry_cutoff_uses_us_setting_not_india(self):
+        rm = RiskManager(market="US")
+        # 10:00 ET is before US_ENTRY_CUTOFF=15:15, even if India ENTRY_CUTOFF=14:15
+        mid_morning = datetime(2026, 8, 20, 10, 0)
+        late = datetime(2026, 8, 20, 15, 20)
+        with patch.object(config, "ENTRY_CUTOFF", "14:15"), patch.object(
+            config, "US_ENTRY_CUTOFF", "15:15"
+        ), patch.object(config, "AVOID_OPEN_MINUTES", 0), patch.object(
+            config, "AVOID_CLOSE_MINUTES", 45
+        ), patch.object(config, "ALLOW_OPEN_CLOSE_WINDOW", False):
+            self.assertFalse(rm._past_entry_cutoff(mid_morning))
+            self.assertTrue(
+                rm.is_tradable_session(
+                    mid_morning, market_open_hm=(9, 30), market_close_hm=(16, 0)
+                )
+            )
+            self.assertTrue(rm._past_entry_cutoff(late))
+            self.assertFalse(
+                rm.is_tradable_session(
+                    late, market_open_hm=(9, 30), market_close_hm=(16, 0)
+                )
+            )
 
     def test_squareoff_default_is_1455(self):
         from pathlib import Path

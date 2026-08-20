@@ -426,6 +426,28 @@ class TestEntryCutoffAndCompletedBars(unittest.TestCase):
         orb.assert_not_called()
         mr.assert_not_called()
 
+    def test_us_ignores_india_ist_cutoff_during_nyse_morning(self):
+        """7:30 PM IST / 10:00 AM ET must NOT be blocked by India ENTRY_CUTOFF=14:15."""
+        et = ZoneInfo("America/New_York")
+        now_et = datetime(2026, 8, 20, 10, 0, tzinfo=et)
+        strat = create_strategy("US", name="mis_regime")
+        df = _session_df()
+        df = strat.compute_indicators(df)
+        with patch("strategy.now_et", return_value=now_et), patch.object(
+            config, "ENTRY_CUTOFF", "14:15"
+        ), patch.object(config, "US_ENTRY_CUTOFF", "15:15"), patch.object(
+            config, "LOSS_REENTRY_COOLDOWN_MIN", 0
+        ), patch.object(
+            strat, "classify_regime", return_value=(REGIME_TREND_UP, "forced")
+        ), patch.object(strat, "_trend_up_clear", return_value=True), patch.object(
+            strat, "_playbook_vwap_momentum_rs", return_value=("BUY", "mom")
+        ), patch.object(
+            strat, "_playbook_ema_pullback", return_value=("HOLD", "x")
+        ):
+            sig = strat.generate_signal(df, "AAPL")
+        self.assertEqual(sig, "BUY")
+        self.assertNotIn("ENTRY_CUTOFF", strat.last_decision.get("reason", ""))
+
     def test_forming_candle_never_used_for_buy(self):
         strat = create_strategy("INDIA", name="mis_regime")
         now = datetime.now(IST)
