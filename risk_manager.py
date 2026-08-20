@@ -44,16 +44,33 @@ def _round_px(market: str, price: float, mode: str = "nearest") -> float:
 class RiskManager:
     def __init__(self, market: str = "US"):
         self.market = market.upper()
-        self.risk_per_trade = config.RISK_PER_TRADE
-        self.max_position_pct = config.MAX_POSITION_PCT
+        if self.market == "US":
+            self.risk_per_trade = float(
+                getattr(config, "US_RISK_PER_TRADE", config.RISK_PER_TRADE)
+            )
+            self.max_position_pct = float(
+                getattr(config, "US_MAX_POSITION_PCT", 0.80)
+            )
+            self.daily_drawdown_limit = float(
+                getattr(config, "US_DAILY_DRAWDOWN_LIMIT", config.DAILY_DRAWDOWN_LIMIT)
+            )
+            self.max_open_positions = int(
+                getattr(config, "US_MAX_OPEN_POSITIONS", 1)
+            )
+            self.max_cluster_positions = int(
+                getattr(config, "US_MAX_CLUSTER_POSITIONS", 1)
+            )
+        else:
+            self.risk_per_trade = config.RISK_PER_TRADE
+            self.max_position_pct = config.MAX_POSITION_PCT
+            self.daily_drawdown_limit = config.DAILY_DRAWDOWN_LIMIT
+            self.max_open_positions = config.MAX_OPEN_POSITIONS
+            self.max_cluster_positions = config.MAX_CLUSTER_POSITIONS
         self.atr_stop_mult = config.ATR_STOP_MULT
         self.atr_trail_mult = config.ATR_TRAIL_MULT
         self.take_profit_r = config.TAKE_PROFIT_R
         self.stop_loss_pct = config.STOP_LOSS_PCT
         self.take_profit_pct = config.TAKE_PROFIT_PCT
-        self.daily_drawdown_limit = config.DAILY_DRAWDOWN_LIMIT
-        self.max_open_positions = config.MAX_OPEN_POSITIONS
-        self.max_cluster_positions = config.MAX_CLUSTER_POSITIONS
 
         # Track high-water marks for trailing stops: symbol -> peak price since entry
         self._trail_peaks: dict[str, float] = {}
@@ -97,17 +114,19 @@ class RiskManager:
         return journal.expanduser().resolve().parent / f"{self.market.lower()}_trade_state.json"
 
     # -----------------------------------------------------------------------
-    # India capital sleeve (INDIA_CAPITAL_CAP)
+    # Capital sleeve (INDIA_CAPITAL_CAP / US_CAPITAL_CAP)
     # -----------------------------------------------------------------------
     def capital_cap(self) -> float:
-        """Return INDIA_CAPITAL_CAP when this is the India book; else 0 (no sleeve)."""
-        if self.market != "INDIA":
-            return 0.0
-        return float(getattr(config, "INDIA_CAPITAL_CAP", 0) or 0)
+        """Return market capital cap when set; else 0 (no sleeve)."""
+        if self.market == "INDIA":
+            return float(getattr(config, "INDIA_CAPITAL_CAP", 0) or 0)
+        if self.market == "US":
+            return float(getattr(config, "US_CAPITAL_CAP", 0) or 0)
+        return 0.0
 
     def effective_equity(self, equity: float) -> float:
         """
-        Sizing / risk base: min(equity, INDIA_CAPITAL_CAP) when cap > 0 (India only).
+        Sizing / risk base: min(equity, capital_cap) when cap > 0.
         """
         eq = float(equity or 0)
         cap = self.capital_cap()
@@ -119,9 +138,8 @@ class RiskManager:
         self, current_equity: float, start_of_day_equity: float
     ) -> float:
         """
-        Daily loss as a fraction of the MIS sleeve base.
-        base = min(SOD, INDIA_CAPITAL_CAP) when cap > 0, else SOD.
-        So a ₹5k loss on a ₹3L account with ₹1.5L cap ≈ 3.33% sleeve DD.
+        Daily loss as a fraction of the sizing sleeve base.
+        base = min(SOD, capital_cap) when cap > 0, else SOD.
         """
         sod = float(start_of_day_equity or 0)
         cur = float(current_equity or 0)
@@ -147,23 +165,28 @@ class RiskManager:
     ) -> int:
         """
         qty = min(shares_risk, max_by_pct, MAX_SHARES_PER_ORDER)
-        equity = min(equity, available_cash, INDIA_CAPITAL_CAP) on India.
-        MAX_POSITION_PCT=1.00 means 100% of sleeve notional (MIS ~5x on margin).
+        equity = min(equity, available_cash, capital_cap) when cap > 0.
+        MAX_POSITION_PCT=1.00 means 100% of sleeve notional (India MIS may exceed 1x).
         """
         eq = float(equity or 0)
         cash = float(available_cash) if available_cash is not None else eq
-        cap = self.capital_cap() if self.market == "INDIA" else 0.0
+        cap = self.capital_cap()
         if cap > 0:
             equity = min(eq, cash, cap)
         elif available_cash is not None:
             equity = min(eq, cash)
         else:
-            equity = self.effective_equity(eq) if self.market == "INDIA" else eq
+            equity = self.effective_equity(eq)
         if price <= 0 or equity <= 0:
             logger.warning("Invalid equity/price for sizing — 0 shares.")
             return 0
 
-        max_shares = int(getattr(config, "MAX_SHARES_PER_ORDER", 500) or 500)
+        if self.market == "US":
+            max_shares = int(
+                getattr(config, "US_MAX_SHARES_PER_ORDER", 50) or 50
+            )
+        else:
+            max_shares = int(getattr(config, "MAX_SHARES_PER_ORDER", 500) or 500)
         stop = float(stop_distance or 0)
         min_stop_pct = float(getattr(config, "MIN_STOP_PCT", 0.0) or 0.0)
         if min_stop_pct > 0 and price > 0:
@@ -436,7 +459,7 @@ class RiskManager:
 
     def portfolio_risk_budget_rupees(self, equity: float) -> float:
         """Max open+pending risk ≈ daily drawdown budget on the sizing sleeve."""
-        base = self.effective_equity(equity) if self.market == "INDIA" else float(equity or 0)
+        base = self.effective_equity(equity)
         return max(0.0, float(base) * float(self.daily_drawdown_limit))
 
     def open_risk_rupees(self, positions: dict | None = None) -> float:
@@ -871,7 +894,7 @@ class RiskManager:
                 bot_state.activate_kill_switch(self.market, "invalid_sod")
                 return True
 
-            if self.market == "INDIA" and cap > 0:
+            if cap > 0:
                 drawdown = self.drawdown_vs_cap(current_equity, start_of_day_equity)
                 base = self.effective_equity(start_of_day_equity)
                 dd_note = f"vs sleeve base={base:,.0f}"

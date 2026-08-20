@@ -445,7 +445,20 @@ US_LIVE_CONFIRMED: bool = US_LIVE_TRADING and US_LIVE_CONFIRM == "YES_REAL_MONEY
 _US_PAPER_ENV: bool = _env_bool("US_PAPER", "true")
 US_PAPER: bool = _US_PAPER_ENV and not US_LIVE_CONFIRMED
 
-US_PAPER_STARTING_CASH: float = _env_float("US_PAPER_STARTING_CASH", "10000")
+# Paper starting cash — match current funded US wallet (raise when you deposit more).
+US_PAPER_STARTING_CASH: float = _env_float("US_PAPER_STARTING_CASH", "500")
+
+# Soft buying-power sleeve for US sizing + daily DD (cash Global Stocks, not MIS).
+# Keep at funded wallet size; bump to 1000 after the second $500 deposit.
+US_CAPITAL_CAP: float = _env_float("US_CAPITAL_CAP", "500")
+
+# US cash risk overrides (India MIS leverage must NOT apply here).
+US_RISK_PER_TRADE: float = _env_float("US_RISK_PER_TRADE", "0.01")  # 1% of sleeve (~$5 on $500)
+US_MAX_POSITION_PCT: float = _env_float("US_MAX_POSITION_PCT", "0.80")  # max 80% cash per name
+US_MAX_OPEN_POSITIONS: int = _env_int("US_MAX_OPEN_POSITIONS", "1")
+US_MAX_CLUSTER_POSITIONS: int = _env_int("US_MAX_CLUSTER_POSITIONS", "1")
+US_MAX_SHARES_PER_ORDER: int = _env_int("US_MAX_SHARES_PER_ORDER", "50")
+US_DAILY_DRAWDOWN_LIMIT: float = _env_float("US_DAILY_DRAWDOWN_LIMIT", "0.05")  # 5% of sleeve
 
 # MIS bot: US off unless explicitly US_ENABLED=true
 US_ENABLED: bool = DHAN_CONFIGURED and _env_bool("US_ENABLED", "false")
@@ -454,17 +467,18 @@ US_STOCK_UNIVERSE: list[str] = [
     s.strip().upper()
     for s in os.getenv(
         "US_STOCK_UNIVERSE",
-        "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,JPM,V,UNH",
+        # Prefer liquid names that can fit whole shares on a ~$500 book
+        "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,JPM,AMD,INTC",
     ).split(",")
     if s.strip()
 ]
 
 US_CORRELATION_CLUSTERS: dict[str, list[str]] = {
     "us_mega_tech": ["AAPL", "MSFT", "GOOGL", "META"],
-    "us_ai_semi": ["NVDA", "TSLA"],
+    "us_ai_semi": ["NVDA", "AMD", "TSLA"],
     "us_ecommerce": ["AMZN"],
-    "us_finance": ["JPM", "V"],
-    "us_healthcare": ["UNH"],
+    "us_finance": ["JPM"],
+    "us_semi_value": ["INTC"],
 }
 
 # Per-market strategy params (US)
@@ -479,5 +493,5 @@ US_ADX_RANGE_MAX: float = _env_float("US_ADX_RANGE_MAX", str(ADX_RANGE_MAX))
 
 REGIME_SYMBOL_US: str = os.getenv("REGIME_SYMBOL_US", "AAPL").strip().upper()
 
-US_LOOP_INTERVAL_SEC: int = _env_int("US_LOOP_INTERVAL_SEC", "300")
+US_LOOP_INTERVAL_SEC: int = _env_int("US_LOOP_INTERVAL_SEC", "60")
 

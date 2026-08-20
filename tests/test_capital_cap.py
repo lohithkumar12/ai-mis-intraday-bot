@@ -1,4 +1,4 @@
-"""INDIA_CAPITAL_CAP sizing + drawdown sleeve tests."""
+"""INDIA_CAPITAL_CAP / US_CAPITAL_CAP sizing + drawdown sleeve tests."""
 
 from __future__ import annotations
 
@@ -82,6 +82,38 @@ class TestIndiaCapitalCap(unittest.TestCase):
         self.assertTrue(rm_dash.is_kill_switch_active)
         rm_dash.reset_kill_switch()
         self.assertFalse(rm_loop.is_kill_switch_active)
+
+
+class TestUSCapitalCap(unittest.TestCase):
+    def setUp(self):
+        bot_state.reset_kill_for_tests()
+
+    def test_us_effective_equity_caps_at_500(self):
+        rm = RiskManager(market="US")
+        with patch.object(config, "US_CAPITAL_CAP", 500.0):
+            self.assertEqual(rm.effective_equity(1000.0), 500.0)
+            self.assertEqual(rm.effective_equity(400.0), 400.0)
+
+    def test_us_cash_sizing_uses_cap_not_leverage(self):
+        rm = RiskManager(market="US")
+        rm.risk_per_trade = 0.01
+        rm.max_position_pct = 0.80
+        with patch.object(config, "US_CAPITAL_CAP", 500.0):
+            with patch.object(config, "US_MAX_SHARES_PER_ORDER", 50):
+                # risk 1% of $500 = $5; stop $1 → 5 shares
+                # max_by_pct = 500*0.8/100 = 4 shares → final 4
+                qty = rm.calculate_position_size(
+                    2000.0, price=100.0, stop_distance=1.0
+                )
+                self.assertEqual(qty, 4)
+
+    def test_us_drawdown_vs_sleeve(self):
+        rm = RiskManager(market="US")
+        rm.daily_drawdown_limit = 0.05
+        with patch.object(config, "US_CAPITAL_CAP", 500.0):
+            # $25 loss on $1000 book with $500 sleeve = 5% → trip
+            tripped = rm.check_daily_drawdown(975.0, 1000.0)
+            self.assertTrue(tripped)
 
 
 if __name__ == "__main__":

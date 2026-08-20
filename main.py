@@ -1315,6 +1315,7 @@ def run_us_loop(strategy, risk_mgr, rs_filter=None):
     from us_client import get_shared_us_broker
 
     logger.info("[US] US Market trading loop starting (24/7 process)...")
+    risk_mgr.load_state()
 
     try:
         us_broker = get_shared_us_broker(auto_login=True)
@@ -1342,7 +1343,10 @@ def run_us_loop(strategy, risk_mgr, rs_filter=None):
 
     logger.info(
         f"[US] Ready | Mode={'PAPER SIM + live US data' if paper else 'LIVE REAL MONEY'} "
-        f"| Strategy={strategy.name}"
+        f"| Strategy={strategy.name} "
+        f"| capital_cap=${float(getattr(config, 'US_CAPITAL_CAP', 0) or 0):,.0f} "
+        f"| risk/trade={float(getattr(config, 'US_RISK_PER_TRADE', 0.01)):.1%} "
+        f"| max_pos={float(getattr(config, 'US_MAX_POSITION_PCT', 0.8)):.0%}"
     )
 
     while True:
@@ -1484,9 +1488,11 @@ def run_us_loop(strategy, risk_mgr, rs_filter=None):
                         logger.warning(f"[US] {symbol}: BUY skipped — no usable price")
                         continue
 
-                    sizing_equity = min(
-                        current_equity,
-                        float(account.get("available_cash") or current_equity),
+                    sizing_equity = risk_mgr.effective_equity(
+                        min(
+                            current_equity,
+                            float(account.get("available_cash") or current_equity),
+                        )
                     )
 
                     sl = risk_mgr.get_stop_loss_price(limit_price, atr)
@@ -1495,7 +1501,12 @@ def run_us_loop(strategy, risk_mgr, rs_filter=None):
                     )
                     stop_dist = limit_price - sl
                     qty = risk_mgr.calculate_position_size(
-                        sizing_equity, limit_price, stop_distance=stop_dist
+                        sizing_equity,
+                        limit_price,
+                        stop_distance=stop_dist,
+                        available_cash=float(
+                            account.get("available_cash") or sizing_equity
+                        ),
                     )
                     if qty <= 0:
                         logger.warning(

@@ -81,6 +81,53 @@ class TestUSBrokerSafety(unittest.TestCase):
             self.assertIsNone(order_id)
             self.assertIn("Live trading not confirmed", broker.last_error)
 
+    def test_live_buy_calls_place_global_order_with_sl_tp(self):
+        with patch.object(config, "US_LIVE_CONFIRMED", True), \
+             patch.object(config, "US_PAPER", False):
+            broker = USBroker(auto_login=False)
+            broker.paper = None
+            broker._global_stocks_available = True
+            broker._logged_in = True
+            broker.dhan = MagicMock()
+            broker.dhan.place_global_order.return_value = {
+                "status": "success",
+                "data": {"orderId": "US-LIVE-123"},
+            }
+            with patch("us_instruments.get_us_security_id", return_value="10000025"), \
+                 patch.object(broker, "ensure_session"):
+                order_id = broker.place_buy_order(
+                    "AAPL",
+                    2,
+                    150.0,
+                    stop_loss_price=147.0,
+                    take_profit_price=155.0,
+                )
+            self.assertEqual(order_id, "US-LIVE-123")
+            kwargs = broker.dhan.place_global_order.call_args.kwargs
+            self.assertEqual(kwargs["security_id"], "10000025")
+            self.assertEqual(kwargs["quantity"], 2)
+            self.assertEqual(kwargs["stop_loss_price"], 147.0)
+            self.assertEqual(kwargs["target_price"], 155.0)
+
+    def test_live_sell_calls_place_global_order(self):
+        with patch.object(config, "US_LIVE_CONFIRMED", True), \
+             patch.object(config, "US_PAPER", False):
+            broker = USBroker(auto_login=False)
+            broker.paper = None
+            broker._global_stocks_available = True
+            broker._logged_in = True
+            broker.dhan = MagicMock()
+            broker.dhan.place_global_order.return_value = {
+                "status": "success",
+                "data": {"orderId": "US-SELL-9"},
+            }
+            with patch("us_instruments.get_us_security_id", return_value="10000025"), \
+                 patch.object(broker, "ensure_session"), \
+                 patch.object(broker, "get_latest_quote", return_value={"ltp": 151.0}):
+                order_id = broker.place_sell_order("AAPL", 2, order_type="MARKET")
+            self.assertEqual(order_id, "US-SELL-9")
+            self.assertTrue(broker.dhan.place_global_order.called)
+
 
 class TestUSLiveFeed(unittest.TestCase):
     def test_feed_connected_only_after_tick(self):

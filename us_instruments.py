@@ -71,6 +71,16 @@ US_INSTRUMENTS: dict[str, dict] = {
         "name": "JPMorgan Chase & Co.",
         "exchange": "GLOBAL",
     },
+    "AMD": {
+        "security_id": "10000443",
+        "name": "Advanced Micro Devices Inc.",
+        "exchange": "GLOBAL",
+    },
+    "INTC": {
+        "security_id": "10005258",
+        "name": "Intel Corp.",
+        "exchange": "GLOBAL",
+    },
     "V": {
         "security_id": "10010679",
         "name": "Visa Inc.",

@@ -730,6 +730,7 @@ def get_segments_status():
     us_info = {
         "enabled": config.US_ENABLED,
         "mode": "PAPER" if config.US_PAPER else ("LIVE" if config.US_LIVE_CONFIRMED else "DISABLED"),
+        "capital_cap": float(getattr(config, "US_CAPITAL_CAP", 0) or 0),
         "live_feed": us_feed_summary,
         "scrip_master": us_master,
     }
@@ -1069,6 +1070,7 @@ def get_us_status():
         "broker": "dhan_global",
         "paper_trading": config.US_PAPER,
         "live_armed": config.US_LIVE_CONFIRMED,
+        "capital_cap": float(getattr(config, "US_CAPITAL_CAP", 0) or 0),
         "global_activated": us_broker.global_stocks_available,
         "live_feed": us_feed_summary,
         "strategy": config.STRATEGY_NAME,
@@ -1251,7 +1253,12 @@ def buy_us_stock():
             return jsonify({"status": "error", "message": "Invalid qty"}), 400
     else:
         stop_dist = price - sl
-        qty = us_risk.calculate_position_size(account["equity"], price, stop_distance=stop_dist)
+        qty = us_risk.calculate_position_size(
+            account["equity"],
+            price,
+            stop_distance=stop_dist,
+            available_cash=float(account.get("available_cash") or account["equity"]),
+        )
 
     if qty <= 0:
         return jsonify({"status": "error", "message": "Position sizing calculated 0 shares"}), 400

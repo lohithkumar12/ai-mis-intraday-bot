@@ -252,9 +252,15 @@ class USBroker:
                                     self.access_token = refreshed
                                     token = refreshed
                                     self.dhan = self._build_client(refreshed)
+                    elif isinstance(funds, dict):
+                        # Success / non-failure → Global Stocks reachable
+                        self._global_stocks_available = True
                 except Exception as ge:
-                    logger.warning(f"[US] Global fund limit probe: {ge} (may not be activated)")
-                    self._global_stocks_available = False
+                    # Transient probe errors must NOT permanently disable live orders
+                    logger.warning(
+                        f"[US] Global fund limit probe: {ge} "
+                        "(keeping Global Stocks enabled; orders may still work)"
+                    )
 
                 self.access_token = token
                 self._session_time = datetime.now()
@@ -877,13 +883,20 @@ class USBroker:
 
         try:
             from dhanhq import dhanhq as DhanHQ
-            raw = self.dhan.place_global_order(
-                security_id=str(sec_id),
-                transaction_type=DhanHQ.BUY,
-                quantity=int(qty),
-                order_type=DhanHQ.LIMIT,
-                price=float(round(limit_price * 1.001, 2)),
-            )
+            order_kwargs = {
+                "security_id": str(sec_id),
+                "transaction_type": DhanHQ.BUY,
+                "quantity": int(qty),
+                "order_type": DhanHQ.LIMIT,
+                "price": float(round(limit_price * 1.001, 2)),
+            }
+            # Attach broker-side protective exits when provided
+            if stop_loss_price is not None and float(stop_loss_price) > 0:
+                order_kwargs["stop_loss_price"] = float(round(float(stop_loss_price), 2))
+            if take_profit_price is not None and float(take_profit_price) > 0:
+                order_kwargs["target_price"] = float(round(float(take_profit_price), 2))
+
+            raw = self.dhan.place_global_order(**order_kwargs)
             order_id = self._extract_order_id(raw)
             if not order_id:
                 logger.error(f"[US LIVE] BUY rejected for {symbol}: {raw}")
@@ -892,7 +905,8 @@ class USBroker:
 
             logger.warning(
                 f"[US LIVE] BUY ORDER | {symbol} | Qty={qty} | "
-                f"Limit=${limit_price:.2f} | Order ID={order_id}"
+                f"Limit=${limit_price:.2f} | SL={stop_loss_price} | "
+                f"TP={take_profit_price} | Order ID={order_id}"
             )
             return order_id
         except Exception as e:
