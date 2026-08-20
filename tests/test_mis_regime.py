@@ -431,7 +431,20 @@ class TestEntryCutoffAndCompletedBars(unittest.TestCase):
         et = ZoneInfo("America/New_York")
         now_et = datetime(2026, 8, 20, 10, 0, tzinfo=et)
         strat = create_strategy("US", name="mis_regime")
-        df = _session_df()
+        # Completed ET bars only (end before now_et=10:00)
+        start = datetime(2026, 8, 19, 10, 0, tzinfo=et)
+        idx = pd.date_range(start=start, periods=80, freq="5min", tz=et)
+        idx = idx[idx + pd.Timedelta(minutes=5) <= now_et]
+        df = pd.DataFrame(
+            {
+                "open": np.linspace(100, 110, len(idx)),
+                "high": np.linspace(101, 111, len(idx)),
+                "low": np.linspace(99, 109, len(idx)),
+                "close": np.linspace(100.5, 110.5, len(idx)),
+                "volume": np.full(len(idx), 1_000_000.0),
+            },
+            index=idx,
+        )
         df = strat.compute_indicators(df)
         with patch("strategy.now_et", return_value=now_et), patch.object(
             config, "ENTRY_CUTOFF", "14:15"
@@ -445,7 +458,7 @@ class TestEntryCutoffAndCompletedBars(unittest.TestCase):
             strat, "_playbook_ema_pullback", return_value=("HOLD", "x")
         ):
             sig = strat.generate_signal(df, "AAPL")
-        self.assertEqual(sig, "BUY")
+        self.assertEqual(sig, "BUY", msg=str(strat.last_decision))
         self.assertNotIn("ENTRY_CUTOFF", strat.last_decision.get("reason", ""))
 
     def test_forming_candle_never_used_for_buy(self):

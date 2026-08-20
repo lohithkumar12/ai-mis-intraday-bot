@@ -156,6 +156,45 @@ class TestUSBrokerSafety(unittest.TestCase):
             self.assertEqual(info["equity"], 500.0)
             self.assertEqual(info["buying_power"], 500.0)
 
+    def test_historical_bars_uses_inx_eq_not_nse(self):
+        from datetime import datetime, timezone
+        from us_broker import USBroker
+
+        with patch.object(config, "US_LIVE_CONFIRMED", True), \
+             patch.object(config, "US_PAPER", False), \
+             patch.object(config, "TIMEFRAME", "5"):
+            broker = USBroker(auto_login=False)
+            broker.paper = None
+            broker._logged_in = True
+            broker.dhan = MagicMock()
+            n = 40
+            import time as _t
+            base = int(_t.time()) - n * 300
+            broker.dhan.intraday_minute_data.return_value = {
+                "status": "success",
+                "data": {
+                    "timestamp": [base + i * 300 for i in range(n)],
+                    "open": [100.0] * n,
+                    "high": [101.0] * n,
+                    "low": [99.0] * n,
+                    "close": [100.5] * n,
+                    "volume": [1000] * n,
+                },
+            }
+            broker.dhan.convert_to_date_time.side_effect = (
+                lambda t: datetime.fromtimestamp(int(t), tz=timezone.utc)
+            )
+            with patch("us_broker.get_us_security_id", return_value="10000025"), \
+                 patch("us_broker._fetch_yahoo_candles") as yahoo:
+                df = broker.get_historical_bars("AAPL")
+            self.assertIsNotNone(df)
+            self.assertGreaterEqual(len(df), 30)
+            yahoo.assert_not_called()
+            kwargs = broker.dhan.intraday_minute_data.call_args.kwargs
+            self.assertEqual(kwargs["exchange_segment"], "INX_EQ")
+            self.assertEqual(kwargs["interval"], 5)
+            self.assertEqual(str(df.index.tz), "America/New_York")
+
 
 class TestUSLiveFeed(unittest.TestCase):
     def test_feed_connected_only_after_tick(self):

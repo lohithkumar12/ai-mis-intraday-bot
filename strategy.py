@@ -248,16 +248,19 @@ def completed_bars_only(
 
 
 def calc_session_vwap(
-    df: pd.DataFrame, session_open_hm: tuple[int, int] = (9, 15)
+    df: pd.DataFrame,
+    session_open_hm: tuple[int, int] = (9, 15),
+    tz=None,
 ) -> pd.Series:
     """
-    Session VWAP from today's 09:15 IST completed bars:
+    Session VWAP from today's session-open completed bars:
 
         typical_price = (high + low + close) / 3
         VWAP = cumsum(typical_price * volume) / cumsum(volume)
 
     Resets each calendar session. Pre-open bars are NaN.
     A RangeIndex (tests) is treated as a single session using every row.
+    tz defaults to Asia/Kolkata; pass America/New_York for US.
     """
     if df is None or df.empty:
         return pd.Series(dtype=float)
@@ -271,9 +274,13 @@ def calc_session_vwap(
         cum_vol = vol.cumsum().replace(0, np.nan)
         return tpv.cumsum() / cum_vol
 
-    ist = _ist_tz()
+    local_tz = tz or _ist_tz()
     idx = df.index
-    local = idx.tz_localize(ist) if getattr(idx, "tz", None) is None else idx.tz_convert(ist)
+    local = (
+        idx.tz_localize(local_tz)
+        if getattr(idx, "tz", None) is None
+        else idx.tz_convert(local_tz)
+    )
     open_m = int(session_open_hm[0]) * 60 + int(session_open_hm[1])
     vwap_vals = np.full(len(df), np.nan, dtype=float)
     cum_tpv = 0.0
@@ -296,15 +303,21 @@ def calc_session_vwap(
 
 
 def in_open_drive_window(
-    now: datetime | None = None, window_minutes: int | None = None
+    now: datetime | None = None,
+    window_minutes: int | None = None,
+    *,
+    market: str = "INDIA",
 ) -> bool:
-    """True during [09:15, 09:15 + ORB_WINDOW_MINUTES) IST."""
+    """True during session open drive window (IST 09:15 / US ET 09:30)."""
     if now is None:
-        now = now_ist()
+        now = market_now(market)
     if window_minutes is None:
         window_minutes = int(getattr(config, "ORB_WINDOW_MINUTES", 60) or 60)
     mins = now.hour * 60 + now.minute
-    open_m = 9 * 60 + 15
+    if str(market or "").upper() == "US":
+        open_m = 9 * 60 + 30
+    else:
+        open_m = 9 * 60 + 15
     return open_m <= mins < open_m + int(window_minutes)
 
 
@@ -1270,6 +1283,8 @@ class MisRegimeStrategy(BaseStrategy):
         df: pd.DataFrame,
         vwap: float,
         now: datetime | None = None,
+        *,
+        market: str | None = None,
     ) -> tuple[str, str]:
         """
         Regime precedence (explicit):
@@ -1280,14 +1295,15 @@ class MisRegimeStrategy(BaseStrategy):
         High-ADX mixed tape (not clearly up or down) is treated as TREND_DOWN
         for long-only (HOLD) when close < VWAP, else not TREND_UP.
         """
+        mkt = str(market or getattr(self.p, "market", "INDIA") or "INDIA").upper()
         if now is None:
-            now = now_ist()
+            now = market_now(mkt)
         latest = df.iloc[-1]
         close = float(latest["close"])
         adx_raw = latest.get("ADX")
         adx = float(adx_raw) if adx_raw is not None and not pd.isna(adx_raw) else 0.0
 
-        in_window = in_open_drive_window(now, self.orb_window)
+        in_window = in_open_drive_window(now, self.orb_window, market=mkt)
         expansion_ok, exp_why = self._open_drive_expansion(df)
         if in_window and expansion_ok:
             return REGIME_OPEN_DRIVE, f"window+{exp_why}"
@@ -1473,14 +1489,19 @@ class MisRegimeStrategy(BaseStrategy):
         if "ADX" not in df.columns or "VOL_AVG" not in df.columns:
             df = self.compute_indicators(df)
 
-        vwap_series = calc_session_vwap(df)
+        if market == "US":
+            vwap_series = calc_session_vwap(
+                df, session_open_hm=(9, 30), tz=_et_tz()
+            )
+        else:
+            vwap_series = calc_session_vwap(df)
         vwap_raw = vwap_series.iloc[-1] if len(vwap_series) else np.nan
         if vwap_raw is None or pd.isna(vwap_raw) or float(vwap_raw) <= 0:
             return self._record(symbol, PLAYBOOK_NONE, PLAYBOOK_NONE, "HOLD", "no_session_vwap", [])
         vwap = float(vwap_raw)
         ts = df.index[-1] if len(df.index) else None
 
-        regime, regime_why = self.classify_regime(df, vwap, now=now)
+        regime, regime_why = self.classify_regime(df, vwap, now=now, market=market)
         evaluations: list[dict] = []
 
         def eval_one(playbook: str, pair: tuple[str, str]) -> str:
