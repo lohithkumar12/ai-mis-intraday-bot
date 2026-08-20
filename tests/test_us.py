@@ -156,7 +156,7 @@ class TestUSBrokerSafety(unittest.TestCase):
             self.assertEqual(info["equity"], 500.0)
             self.assertEqual(info["buying_power"], 500.0)
 
-    def test_historical_bars_uses_inx_eq_not_nse(self):
+    def test_historical_bars_uses_dhan_when_inx_ok(self):
         from datetime import datetime, timezone
         from us_broker import USBroker
 
@@ -192,8 +192,52 @@ class TestUSBrokerSafety(unittest.TestCase):
             yahoo.assert_not_called()
             kwargs = broker.dhan.intraday_minute_data.call_args.kwargs
             self.assertEqual(kwargs["exchange_segment"], "INX_EQ")
-            self.assertEqual(kwargs["interval"], 5)
+            self.assertEqual(str(kwargs["interval"]), "5")
+            self.assertTrue(broker._inx_charts_ok)
             self.assertEqual(str(df.index.tz), "America/New_York")
+
+    def test_historical_bars_skips_dhan_after_dh905(self):
+        from us_broker import USBroker
+
+        with patch.object(config, "US_LIVE_CONFIRMED", True), \
+             patch.object(config, "US_PAPER", False), \
+             patch.object(config, "TIMEFRAME", "5"):
+            broker = USBroker(auto_login=False)
+            broker.paper = None
+            broker._logged_in = True
+            broker.dhan = MagicMock()
+            broker.dhan.intraday_minute_data.return_value = {
+                "status": "failure",
+                "remarks": {
+                    "error_code": "DH-905",
+                    "error_type": "Input_Exception",
+                    "error_message": "Missing required fields",
+                },
+                "data": {},
+            }
+            yahoo_df = __import__("pandas").DataFrame(
+                {
+                    "open": [1.0, 1.1],
+                    "high": [1.2, 1.3],
+                    "low": [0.9, 1.0],
+                    "close": [1.05, 1.15],
+                    "volume": [100, 110],
+                },
+                index=__import__("pandas").date_range(
+                    "2026-08-18", periods=2, freq="5min", tz="America/New_York"
+                ),
+            )
+            with patch("us_broker.get_us_security_id", return_value="10000025"), \
+                 patch("us_broker._fetch_yahoo_candles", return_value=yahoo_df) as yahoo:
+                df1 = broker.get_historical_bars("AAPL")
+                broker._candle_cache.clear()
+                df2 = broker.get_historical_bars("MSFT")
+            self.assertIsNotNone(df1)
+            self.assertIsNotNone(df2)
+            self.assertFalse(broker._inx_charts_ok)
+            # First symbol probes Dhan once; second skips after DH-905
+            self.assertEqual(broker.dhan.intraday_minute_data.call_count, 1)
+            self.assertEqual(yahoo.call_count, 2)
 
 
 class TestUSLiveFeed(unittest.TestCase):

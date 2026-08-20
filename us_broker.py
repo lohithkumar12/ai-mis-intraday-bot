@@ -6,7 +6,8 @@ Wraps DhanHQ Global Stocks API methods for US stock trading.
 Handles:
   - Shared Dhan session (same client_id/access_token as India)
   - Global Stocks quotes (LTP via ticker_data or candle fallback)
-  - Historical minute candle data → pandas DataFrame (cached; INX_EQ)
+  - Historical minute candles → pandas DataFrame (Yahoo 5m primary;
+    Dhan /charts does not support INX_EQ — verified DH-905)
   - Account/fund info via get_global_fund_limit()
   - Positions via get_global_holdings()
   - Order placement via place_global_order()
@@ -90,56 +91,79 @@ def _normalize_us_bar_index(df: pd.DataFrame) -> pd.DataFrame:
     return out.sort_index()
 
 
+def _yahoo_chart_hosts() -> tuple[str, ...]:
+    return (
+        "https://query1.finance.yahoo.com",
+        "https://query2.finance.yahoo.com",
+    )
+
+
 def _fetch_yahoo_candles(
     symbol: str, *, interval: str = "5m", range_: str = "5d"
 ) -> pd.DataFrame | None:
     """
-    Fallback US bars via Yahoo chart API.
-    Prefer intraday (5m/5d) so mis_regime is not fed daily candles.
+    US intraday bars via Yahoo chart API (primary for Global Stocks).
+
+    Dhan /v2/charts/* accepts NSE_EQ etc. but rejects INX_EQ (DH-905);
+    annexure exchange segments omit INX_EQ. Prefer 5m/5d so mis_regime
+    is not fed daily candles.
     """
     import requests
 
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        f"?interval={interval}&range={range_}"
-    )
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=8)
-        if resp.status_code == 200:
+    path = f"/v8/finance/chart/{symbol}?interval={interval}&range={range_}"
+    for host in _yahoo_chart_hosts():
+        try:
+            resp = requests.get(host + path, headers=headers, timeout=8)
+            if resp.status_code != 200:
+                continue
             data = resp.json()
             result = data.get("chart", {}).get("result", [])
-            if result:
-                timestamps = result[0].get("timestamp", [])
-                quote = result[0].get("indicators", {}).get("quote", [{}])[0]
-                opens = quote.get("open", [])
-                highs = quote.get("high", [])
-                lows = quote.get("low", [])
-                closes = quote.get("close", [])
-                volumes = quote.get("volume", [])
+            if not result:
+                continue
+            timestamps = result[0].get("timestamp", [])
+            quote = result[0].get("indicators", {}).get("quote", [{}])[0]
+            opens = quote.get("open", [])
+            highs = quote.get("high", [])
+            lows = quote.get("low", [])
+            closes = quote.get("close", [])
+            volumes = quote.get("volume", [])
 
-                if timestamps and closes:
-                    df = pd.DataFrame(
-                        {
-                            "open": opens,
-                            "high": highs,
-                            "low": lows,
-                            "close": closes,
-                            "volume": [v if v is not None else 0 for v in volumes],
-                        },
-                        index=pd.to_datetime(timestamps, unit="s", utc=True),
-                    )
-                    df = df.dropna(subset=["close"]).astype(float).sort_index()
-                    df = _normalize_us_bar_index(df)
-                    if not df.empty:
-                        logger.info(
-                            f"[US] {symbol}: Loaded {len(df)} {interval} candles "
-                            f"via Yahoo fallback ({range_})"
-                        )
-                        return df
-    except Exception as e:
-        logger.debug(f"[US] Fallback feed for {symbol} error: {e}")
+            if not timestamps or not closes:
+                continue
+            df = pd.DataFrame(
+                {
+                    "open": opens,
+                    "high": highs,
+                    "low": lows,
+                    "close": closes,
+                    "volume": [v if v is not None else 0 for v in volumes],
+                },
+                index=pd.to_datetime(timestamps, unit="s", utc=True),
+            )
+            df = df.dropna(subset=["close"]).astype(float).sort_index()
+            df = _normalize_us_bar_index(df)
+            if not df.empty:
+                logger.info(
+                    f"[US] {symbol}: Loaded {len(df)} {interval} candles "
+                    f"via Yahoo ({range_})"
+                )
+                return df
+        except Exception as e:
+            logger.debug(f"[US] Yahoo chart {host} for {symbol}: {e}")
     return None
+
+
+def _dhan_error_code(resp) -> str:
+    if not isinstance(resp, dict):
+        return ""
+    for blob in (resp.get("remarks"), resp.get("data"), resp):
+        if not isinstance(blob, dict):
+            continue
+        code = blob.get("error_code") or blob.get("errorCode")
+        if code:
+            return str(code)
+    return ""
 
 
 def get_shared_us_broker(auto_login: bool = True) -> "USBroker":
@@ -179,6 +203,8 @@ class USBroker:
         self._quote_warn_at: dict[str, float] = {}
         self._login_lock = threading.Lock()
         self._global_stocks_available = True
+        # None=unknown, True=works, False=INX_EQ charts rejected (DH-905) — skip forever this process
+        self._inx_charts_ok: bool | None = None
 
         self.paper = USPaperPortfolio() if config.US_PAPER else None
         mode = "PAPER SIM (live US data, fake USD)" if self.paper else "LIVE REAL MONEY"
@@ -544,11 +570,11 @@ class USBroker:
 
     def get_historical_bars(self, symbol: str, days: int | None = None) -> pd.DataFrame | None:
         """
-        Load US equity bars for strategy (prefer Dhan INX_EQ intraday).
+        Load US equity bars for strategy.
 
-        days=None → US_INTRADAY_LOOKBACK_DAYS (minute data, not 300 daily bars).
+        Prefer Yahoo 5m when Dhan /charts rejects INX_EQ (DH-905). Still probes
+        Dhan once per process in case Global chart support is added later.
         """
-        sec_id = get_us_security_id(symbol)
         now_ts = time.time()
         if symbol in self._candle_cache:
             cache_time, cached_df = self._candle_cache[symbol]
@@ -558,89 +584,50 @@ class USBroker:
         lookback = int(days) if days is not None else US_INTRADAY_LOOKBACK_DAYS
         lookback = max(2, min(lookback, 30))
         interval = _us_chart_interval()
-        # Global Stocks segment — NOT NSE_FNO / IDX_I (those caused HTTP 400).
-        segments = ("INX_EQ",)
-        try:
-            from dhanhq import dhanhq as DhanHQ
-
-            if getattr(DhanHQ, "INX", None):
-                segments = (str(DhanHQ.INX), "INX_EQ")
-        except Exception:
-            pass
+        # Dhan API docs use string intervals ("5"); int also works for NSE.
+        interval_payload: int | str = str(interval)
 
         frames: list[pd.DataFrame] = []
-        if self._logged_in and self.dhan and sec_id:
+        sec_id = get_us_security_id(symbol)
+        if (
+            self._inx_charts_ok is not False
+            and self._logged_in
+            and self.dhan
+            and sec_id
+        ):
             to_date = datetime.now(ET)
-            from_date = to_date - timedelta(days=lookback)
-            chunk_start = from_date
+            from_date = to_date - timedelta(days=min(lookback, INTRADAY_CHUNK_DAYS))
             try:
-                while chunk_start < to_date:
-                    chunk_end = min(
-                        chunk_start + timedelta(days=INTRADAY_CHUNK_DAYS), to_date
-                    )
-                    self._throttle_candles()
-
-                    resp = None
-                    for segment in segments:
-                        try:
-                            resp = self.dhan.intraday_minute_data(
-                                security_id=str(sec_id),
-                                exchange_segment=segment,
-                                instrument_type="EQUITY",
-                                from_date=chunk_start.strftime("%Y-%m-%d %H:%M:%S"),
-                                to_date=chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
-                                interval=interval,
+                self._throttle_candles()
+                resp = self.dhan.intraday_minute_data(
+                    security_id=str(sec_id),
+                    exchange_segment="INX_EQ",
+                    instrument_type="EQUITY",
+                    from_date=from_date.strftime("%Y-%m-%d %H:%M:%S"),
+                    to_date=to_date.strftime("%Y-%m-%d %H:%M:%S"),
+                    interval=interval_payload,
+                )
+                if self._ok(resp):
+                    part = self._parse_intraday(self._data(resp))
+                    if part is not None and not part.empty:
+                        frames.append(_normalize_us_bar_index(part))
+                        self._inx_charts_ok = True
+                        logger.debug(
+                            f"[US] {symbol}: Dhan INX_EQ intraday ok "
+                            f"interval={interval}m"
+                        )
+                else:
+                    code = _dhan_error_code(resp)
+                    if code == "DH-905" or self._inx_charts_ok is None:
+                        if self._inx_charts_ok is not False:
+                            logger.warning(
+                                "[US] Dhan /charts does not support INX_EQ "
+                                f"({code or 'fail'}) — using Yahoo 5m for US bars"
                             )
-                            if self._ok(resp):
-                                logger.debug(
-                                    f"[US] {symbol}: intraday ok segment={segment} "
-                                    f"interval={interval}m"
-                                )
-                                break
-                            else:
-                                logger.debug(
-                                    f"[US] {symbol}: intraday fail segment={segment} "
-                                    f"→ {resp}"
-                                )
-                        except Exception as e:
-                            logger.debug(
-                                f"[US] {symbol}: intraday exception segment={segment}: {e}"
-                            )
-                            continue
-
-                    if resp and self._ok(resp):
-                        part = self._parse_intraday(self._data(resp))
-                        if part is not None and not part.empty:
-                            frames.append(_normalize_us_bar_index(part))
-                    chunk_start = chunk_end
-
-                # Daily only as last Dhan attempt (still INX_EQ) — not for mis_regime primary path
-                if not frames:
-                    for segment in segments:
-                        try:
-                            self._throttle_candles()
-                            resp = self.dhan.historical_daily_data(
-                                security_id=str(sec_id),
-                                exchange_segment=segment,
-                                instrument_type="EQUITY",
-                                from_date=(to_date - timedelta(days=120)).strftime(
-                                    "%Y-%m-%d"
-                                ),
-                                to_date=to_date.strftime("%Y-%m-%d"),
-                            )
-                            if self._ok(resp):
-                                part = self._parse_intraday(self._data(resp))
-                                if part is not None and not part.empty:
-                                    frames.append(_normalize_us_bar_index(part))
-                                    logger.warning(
-                                        f"[US] {symbol}: using Dhan daily bars "
-                                        f"(intraday unavailable)"
-                                    )
-                                    break
-                        except Exception:
-                            continue
+                        self._inx_charts_ok = False
             except Exception as e:
-                logger.debug(f"[US] Dhan candle fetch for {symbol}: {e}")
+                logger.debug(f"[US] Dhan candle probe for {symbol}: {e}")
+                self._inx_charts_ok = False
 
         if frames:
             df = pd.concat(frames).sort_index()
@@ -653,7 +640,7 @@ class USBroker:
             self._candle_cache[symbol] = (time.time(), df)
             return df
 
-        # Yahoo intraday fallback (5m), not 1d/1y
+        # Yahoo 5m primary (Dhan Global has live feed + orders, not chart history)
         y_interval = f"{interval}m" if interval in (1, 5, 15, 60) else "5m"
         if y_interval == "1m":
             y_range = "7d"
@@ -661,12 +648,12 @@ class USBroker:
             y_range = "5d"
         else:
             y_range = "1mo"
-        fallback_df = _fetch_yahoo_candles(
+        yahoo_df = _fetch_yahoo_candles(
             symbol, interval=y_interval, range_=y_range
         )
-        if fallback_df is not None and not fallback_df.empty:
-            self._candle_cache[symbol] = (time.time(), fallback_df)
-            return fallback_df
+        if yahoo_df is not None and not yahoo_df.empty:
+            self._candle_cache[symbol] = (time.time(), yahoo_df)
+            return yahoo_df
 
         if symbol in self._candle_cache:
             return self._candle_cache[symbol][1]
