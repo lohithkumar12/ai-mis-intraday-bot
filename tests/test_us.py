@@ -22,8 +22,20 @@ class TestUSInstruments(unittest.TestCase):
         symbols = get_all_us_symbols()
         self.assertIn("AAPL", symbols)
         self.assertIn("NVDA", symbols)
+        self.assertIn("INTC", symbols)
+        self.assertIn("F", symbols)
+        self.assertIn("SOFI", symbols)
         self.assertTrue(is_us_symbol("AAPL"))
         self.assertIsNotNone(get_us_security_id("AAPL"))
+        self.assertEqual(get_us_security_id("F"), "10003455")
+
+    def test_default_universe_prefers_cheap_names(self):
+        univ = list(getattr(config, "US_STOCK_UNIVERSE", []) or [])
+        self.assertIn("INTC", univ)
+        self.assertIn("F", univ)
+        self.assertNotIn("NVDA", univ)
+        self.assertLessEqual(float(config.US_VWAP_STRETCH_ATR), 1.0)
+        self.assertGreaterEqual(float(config.US_RSI_OVERSOLD), 40)
 
     def test_security_ids_are_global_scrip_codes(self):
         """SCRIP_CODEs from official master are 8-digit (1xxxxxxx), not stale 199xx."""

@@ -402,6 +402,39 @@ class TestVwapMeanReversion(unittest.TestCase):
         self.assertEqual(sig, "BUY")
         self.assertIn("reclaim", why)
 
+    def test_us_looser_stretch_and_rsi_vs_india(self):
+        """US uses US_VWAP_STRETCH_ATR / US_RSI_OVERSOLD; India stays strict."""
+        from strategy import create_strategy
+
+        india, df_i = _ready_strat()
+        us = create_strategy("US", name="mis_regime")
+        df_u = df_i.copy()
+        for df in (df_i, df_u):
+            df["ADX"] = 15.0
+            df["ATR"] = 2.0
+        rsi_i = f"RSI_{india.p.rsi_period}"
+        rsi_u = f"RSI_{us.p.rsi_period}"
+        df_i[rsi_i] = 38.0
+        df_u[rsi_u] = 38.0
+        vwap = float(calc_session_vwap(df_i).iloc[-1])
+        # Mild stretch: passes US 0.7*ATR, fails India 1.5*ATR (when India env=1.5)
+        mild = vwap - 1.6
+        for df in (df_i, df_u):
+            df.iloc[-2, df.columns.get_loc("high")] = mild - 0.5
+            df.iloc[-1, df.columns.get_loc("close")] = mild
+            df.iloc[-1, df.columns.get_loc("high")] = mild + 0.1
+            df.iloc[-1, df.columns.get_loc("low")] = mild - 0.2
+        with patch.object(config, "VWAP_STRETCH_ATR", 1.5), patch.object(
+            config, "RSI_OVERSOLD", 30
+        ), patch.object(config, "US_VWAP_STRETCH_ATR", 0.70), patch.object(
+            config, "US_RSI_OVERSOLD", 42
+        ):
+            sig_i, why_i = india._playbook_vwap_mr(df_i, "ITC", vwap)
+            sig_u, why_u = us._playbook_vwap_mr(df_u, "INTC", vwap)
+        self.assertEqual(sig_i, "HOLD")
+        self.assertTrue("weak_stretch" in why_i or "rsi=" in why_i)
+        self.assertEqual(sig_u, "BUY", msg=why_u)
+
 
 class TestEntryCutoffAndCompletedBars(unittest.TestCase):
     def test_entry_cutoff_blocks_all_playbook_buys(self):

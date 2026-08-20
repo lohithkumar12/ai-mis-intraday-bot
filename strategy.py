@@ -1363,7 +1363,10 @@ class MisRegimeStrategy(BaseStrategy):
         return "BUY", f"close>{prior_high:.2f} vol_ok rs_leader"
 
     def _is_extended(self, close: float, vwap: float, ema, atr) -> bool:
-        k = float(getattr(config, "EMA_EXTENSION_ATR", 1.0) or 1.0)
+        if self.p.market == "US":
+            k = float(getattr(config, "US_EMA_EXTENSION_ATR", 1.2) or 1.2)
+        else:
+            k = float(getattr(config, "EMA_EXTENSION_ATR", 1.0) or 1.0)
         if atr is None or pd.isna(atr) or float(atr) <= 0:
             return False
         atr_f = float(atr)
@@ -1421,14 +1424,19 @@ class MisRegimeStrategy(BaseStrategy):
             return "HOLD", f"adx={adx:.1f}_not_range"
         if atr <= 0:
             return "HOLD", "atr_invalid"
-        stretch_k = float(getattr(config, "VWAP_STRETCH_ATR", 1.0) or 1.0)
+        if self.p.market == "US":
+            stretch_k = float(getattr(config, "US_VWAP_STRETCH_ATR", 0.7) or 0.7)
+            rsi_os = float(getattr(config, "US_RSI_OVERSOLD", 42) or 42)
+            reclaim_n = max(1, int(getattr(config, "US_VWAP_RECLAIM_BARS", 1) or 1))
+        else:
+            stretch_k = float(getattr(config, "VWAP_STRETCH_ATR", 1.0) or 1.0)
+            rsi_os = float(getattr(config, "RSI_OVERSOLD", 30) or 30)
+            reclaim_n = max(1, int(getattr(config, "VWAP_RECLAIM_BARS", 1) or 1))
         threshold = vwap - stretch_k * atr
         if close > threshold:
             return "HOLD", f"weak_stretch close={close:.2f} > {threshold:.2f}"
-        rsi_os = float(getattr(config, "RSI_OVERSOLD", 30) or 30)
         if rsi > rsi_os:
             return "HOLD", f"rsi={rsi:.1f}>{rsi_os:.0f}"
-        reclaim_n = max(1, int(getattr(config, "VWAP_RECLAIM_BARS", 1) or 1))
         if len(df) < reclaim_n + 1:
             return "HOLD", "not_enough_bars_reclaim"
         # Reclaim: latest completed close > previous completed candle high

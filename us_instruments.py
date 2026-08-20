@@ -81,6 +81,46 @@ US_INSTRUMENTS: dict[str, dict] = {
         "name": "Intel Corp.",
         "exchange": "GLOBAL",
     },
+    "F": {
+        "security_id": "10003455",
+        "name": "Ford Motor Co.",
+        "exchange": "GLOBAL",
+    },
+    "BAC": {
+        "security_id": "10000919",
+        "name": "Bank of America Corp.",
+        "exchange": "GLOBAL",
+    },
+    "T": {
+        "security_id": "10009844",
+        "name": "AT&T Inc.",
+        "exchange": "GLOBAL",
+    },
+    "PFE": {
+        "security_id": "10007845",
+        "name": "Pfizer Inc.",
+        "exchange": "GLOBAL",
+    },
+    "SOFI": {
+        "security_id": "10009476",
+        "name": "SoFi Technologies Inc.",
+        "exchange": "GLOBAL",
+    },
+    "SNAP": {
+        "security_id": "10009432",
+        "name": "Snap Inc.",
+        "exchange": "GLOBAL",
+    },
+    "WBD": {
+        "security_id": "10010999",
+        "name": "Warner Bros. Discovery Inc.",
+        "exchange": "GLOBAL",
+    },
+    "HOOD": {
+        "security_id": "10004773",
+        "name": "Robinhood Markets Inc.",
+        "exchange": "GLOBAL",
+    },
     "V": {
         "security_id": "10010679",
         "name": "Visa Inc.",

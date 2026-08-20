@@ -464,6 +464,13 @@ US_MAX_CLUSTER_POSITIONS: int = _env_int("US_MAX_CLUSTER_POSITIONS", "1")
 US_MAX_SHARES_PER_ORDER: int = _env_int("US_MAX_SHARES_PER_ORDER", "50")
 US_DAILY_DRAWDOWN_LIMIT: float = _env_float("US_DAILY_DRAWDOWN_LIMIT", "0.05")  # 5% of sleeve
 
+# US-only mis_regime filters (looser than India VWAP_STRETCH=1.5 / RSI=30).
+# Lower stretch_k → easier VWAP mean-reversion BUY; higher RSI_OVERSOLD → easier.
+US_VWAP_STRETCH_ATR: float = _env_float("US_VWAP_STRETCH_ATR", "0.70")
+US_RSI_OVERSOLD: float = _env_float("US_RSI_OVERSOLD", "42")
+US_EMA_EXTENSION_ATR: float = _env_float("US_EMA_EXTENSION_ATR", "1.20")
+US_VWAP_RECLAIM_BARS: int = _env_int("US_VWAP_RECLAIM_BARS", "1")
+
 # MIS bot: US off unless explicitly US_ENABLED=true
 US_ENABLED: bool = DHAN_CONFIGURED and _env_bool("US_ENABLED", "false")
 
@@ -471,18 +478,19 @@ US_STOCK_UNIVERSE: list[str] = [
     s.strip().upper()
     for s in os.getenv(
         "US_STOCK_UNIVERSE",
-        # Prefer liquid names that can fit whole shares on a ~$500 book
-        "AAPL,MSFT,GOOGL,AMZN,NVDA,META,TSLA,JPM,AMD,INTC",
+        # Cheap/liquid names that fit whole shares on a ~$500 book
+        "INTC,F,BAC,T,PFE,SOFI,SNAP,WBD,HOOD,AMD",
     ).split(",")
     if s.strip()
 ]
 
 US_CORRELATION_CLUSTERS: dict[str, list[str]] = {
-    "us_mega_tech": ["AAPL", "MSFT", "GOOGL", "META"],
-    "us_ai_semi": ["NVDA", "AMD", "TSLA"],
-    "us_ecommerce": ["AMZN"],
-    "us_finance": ["JPM"],
-    "us_semi_value": ["INTC"],
+    "us_semi": ["INTC", "AMD"],
+    "us_banks": ["BAC"],
+    "us_telco_health": ["T", "PFE"],
+    "us_auto": ["F"],
+    "us_fintech_spec": ["SOFI", "HOOD"],
+    "us_media_tech": ["SNAP", "WBD"],
 }
 
 # Per-market strategy params (US)
@@ -493,9 +501,10 @@ US_RSI_PERIOD: int = _env_int("US_RSI_PERIOD", str(RSI_PERIOD))
 US_RSI_BUY: float = _env_float("US_RSI_BUY", str(RSI_BUY_THRESHOLD))
 US_RSI_SELL: float = _env_float("US_RSI_SELL", str(RSI_SELL_THRESHOLD))
 US_BB_STD: float = _env_float("US_BB_STD", str(BB_STD_DEV))
-US_ADX_RANGE_MAX: float = _env_float("US_ADX_RANGE_MAX", str(ADX_RANGE_MAX))
+# Slightly wider "range" band so VWAP_MR fires more often on US 5m
+US_ADX_RANGE_MAX: float = _env_float("US_ADX_RANGE_MAX", "32")
 
-REGIME_SYMBOL_US: str = os.getenv("REGIME_SYMBOL_US", "AAPL").strip().upper()
+REGIME_SYMBOL_US: str = os.getenv("REGIME_SYMBOL_US", "INTC").strip().upper()
 
 US_LOOP_INTERVAL_SEC: int = _env_int("US_LOOP_INTERVAL_SEC", "60")
 
