@@ -27,10 +27,6 @@ INDIA_PRODUCT_TYPE=CNC
 LIVE_TRADING=false
 LIVE_CONFIRM=
 
-# US Global (REST/Yahoo for quotes — MarketFeed is India/MCX only)
-US_PAPER=true
-US_LIVE_TRADING=false
-US_LIVE_CONFIRM=
 
 # India F&O
 INDIA_FNO_ENABLED=true
@@ -67,8 +63,7 @@ CURRENCY_CAPITAL_CAP=100000
 | **India F&O** | NSE F&O | 09:15 – 15:30 | Index/stock options (defined-risk directional) |
 | **Currency FX** | NSE Currency | 09:00 – 17:00 | USDINR |
 | **MCX Commodities** | MCX | 09:00 – 23:30 | GOLD, SILVER, CRUDEOIL, NATURALGAS (contract windows may vary) |
-| **US Global Stocks** | US | ~19:00 – 01:30 | Via Dhan Global; quotes REST/Yahoo if WS unsupported |
-| 🛑 **Dead Zone** | All | ~01:30 – 09:00 IST weekdays | Bot/dashboard stay up; **no trading** |
+| 🛑 **Dead Zone** | All | ~23:30 – 09:00 IST weekdays | Bot/dashboard stay up; **no trading** |
 | 🛑 **Weekend / holidays** | All | Sat–Sun + exchange holidays | Closed — **NOT 24×7 trading** |
 
 ---
@@ -87,9 +82,8 @@ CURRENCY_CAPITAL_CAP=100000
 | India F&O | `INDIA_FNO_LIVE_TRADING=true` + `INDIA_FNO_LIVE_CONFIRM=YES_REAL_MONEY` |
 | MCX | `MCX_LIVE_TRADING=true` + `MCX_LIVE_CONFIRM=YES_REAL_MONEY` |
 | Currency | `CURRENCY_LIVE_TRADING=true` + `CURRENCY_LIVE_CONFIRM=YES_REAL_MONEY` |
-| US | `US_LIVE_TRADING=true` + `US_LIVE_CONFIRM=YES_REAL_MONEY` |
 
-Live F&O/MCX/Currency **refuse** placeholder security IDs and invented premiums. If scrip master or option chain is missing → order skipped + loud log. Soft-fail if account entitlement (MCX/Global) is inactive.
+Live F&O/MCX/Currency **refuse** placeholder security IDs and invented premiums. If scrip master or option chain is missing → order skipped + loud log. Soft-fail if an account segment entitlement is inactive.
 
 ---
 
@@ -109,7 +103,6 @@ Live F&O/MCX/Currency **refuse** placeholder security IDs and invented premiums.
 - `is_connected()` is true only after a real tick within 60s.
 - Dynamic `subscribe_symbol` updates the live `MarketFeed.subscribe_symbols` list.
 - Reconnect with exponential backoff; quotes fall back to REST/candle cache (throttled).
-- **US symbols**: not on India MarketFeed — status_summary documents REST/Yahoo fallback.
 
 ---
 
@@ -125,7 +118,6 @@ Live F&O/MCX/Currency **refuse** placeholder security IDs and invented premiums.
 
 > [!IMPORTANT]
 > - Whitelist your server **static public IP** in the Dhan Developer Console for live order APIs.
-> - US Global funding may involve **LRS / TCS** — confirm with your bank/Dhan before live US trading.
 > - Paper may log `[PAPER F&O ESTIMATE]` when option chain is closed; **live never uses invented premiums**.
 
 ---

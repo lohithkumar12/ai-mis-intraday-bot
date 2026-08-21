@@ -22,17 +22,13 @@ _log = logging.getLogger(__name__)
 _signals: dict[str, dict[str, Any]] = {}  # market -> {symbol: payload}
 _scout: dict[str, Any] = {}  # market -> near-setups blob (display only)
 _health: dict[str, Any] = {
-    "us_last_cycle": None,
     "india_last_cycle": None,
     "india_scout_last_cycle": None,
-    "us_last_error": None,
     "india_last_error": None,
     "india_scout_last_error": None,
-    "alpaca_429_count": 0,
     "started_at": time.time(),
 }
 _india_sod: dict[str, Any] = {"date": None, "equity": None}
-_us_sod: dict[str, Any] = {"date": None, "equity": None}
 # Shared kill-switch (loop + dashboard must use the same flag)
 _kill: dict[str, dict[str, Any]] = {}
 _kill_loaded = False
@@ -49,7 +45,7 @@ _zombies: dict[str, dict[str, Any]] = {}
 
 
 def _trading_day_iso(market: str) -> str:
-    """IST calendar day for India; NY for US; local date otherwise."""
+    """IST calendar day for India; local date otherwise."""
     key = str(market or "").upper()
     try:
         from zoneinfo import ZoneInfo
@@ -57,8 +53,6 @@ def _trading_day_iso(market: str) -> str:
         from backports.zoneinfo import ZoneInfo  # type: ignore
     if key == "INDIA":
         return datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
-    if key == "US":
-        return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     return date.today().isoformat()
 
 
@@ -282,7 +276,7 @@ def mark_cycle(market: str, error: str | None = None) -> None:
     if m in ("INDIA_SCOUT", "SCOUT"):
         key = "india_scout"
     else:
-        key = "us" if m == "US" else "india"
+        key = "india"
     with _lock:
         _health[f"{key}_last_cycle"] = time.time()
         if error:
@@ -297,27 +291,20 @@ def mark_healthy(market: str) -> None:
     if m in ("INDIA_SCOUT", "SCOUT"):
         key = "india_scout"
     else:
-        key = "us" if m == "US" else "india"
+        key = "india"
     with _lock:
         _health[f"{key}_last_cycle"] = time.time()
         _health[f"{key}_last_error"] = None
-
-
-def note_alpaca_429() -> None:
-    with _lock:
-        _health["alpaca_429_count"] = int(_health.get("alpaca_429_count") or 0) + 1
 
 
 def get_health() -> dict:
     with _lock:
         h = dict(_health)
         now = time.time()
-        us_age = (now - h["us_last_cycle"]) if h.get("us_last_cycle") else None
         in_age = (now - h["india_last_cycle"]) if h.get("india_last_cycle") else None
         sc_age = (
             (now - h["india_scout_last_cycle"]) if h.get("india_scout_last_cycle") else None
         )
-        h["us_cycle_age_sec"] = round(us_age, 1) if us_age is not None else None
         h["india_cycle_age_sec"] = round(in_age, 1) if in_age is not None else None
         h["india_scout_cycle_age_sec"] = round(sc_age, 1) if sc_age is not None else None
         h["uptime_sec"] = round(now - h.get("started_at", now), 1)
@@ -329,8 +316,6 @@ def reset_sod_for_tests() -> None:
     with _lock:
         _india_sod["date"] = None
         _india_sod["equity"] = None
-        _us_sod["date"] = None
-        _us_sod["equity"] = None
 
 
 def reset_tide_for_tests() -> None:
@@ -479,25 +464,3 @@ def india_sod_equity(current_equity: float) -> float:
                 _india_sod,
             )
         return float(_india_sod["equity"])
-
-
-def us_sod_equity(current_equity: float) -> float:
-    """Return start-of-day equity for US (sticky per America/New_York date)."""
-    from datetime import datetime as dt
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        from backports.zoneinfo import ZoneInfo  # type: ignore
-    today_et = dt.now(ZoneInfo("America/New_York")).date().isoformat()
-    with _lock:
-        if _us_sod.get("date") != today_et or _us_sod.get("equity") is None:
-            _us_sod["date"] = today_et
-            _us_sod["equity"] = float(current_equity)
-        else:
-            _rebaseline_sod_if_needed(
-                "US",
-                float(_us_sod["equity"]),
-                float(current_equity),
-                _us_sod,
-            )
-        return float(_us_sod["equity"])

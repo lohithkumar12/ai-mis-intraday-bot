@@ -6,7 +6,7 @@ MIS / INTRADAY India equity bot (same architecture as New_StartUp CNC bot).
   India → Dhan (default) or Angel One — paper sim or live INR
   Product → INTRADAY (MIS) only — flat by square-off; no overnight CNC
 
-US / F&O / MCX / Currency segments stay in the shared code shape but are
+F&O / MCX / Currency segments stay in the shared code shape but are
 DISABLED by default for this MIS project.
 """
 
@@ -108,11 +108,6 @@ INDIA_CAPITAL_CAP: float = _env_float("INDIA_CAPITAL_CAP", "150000")
 # Dhan Paid Data API Live Feed / WebSocket Toggle (India NSE/MCX/FX MarketFeed)
 DHAN_LIVE_WEBSOCKET: bool = _env_bool("DHAN_LIVE_WEBSOCKET", "true") if DHAN_CONFIGURED else False
 
-# Dhan Global Stocks Live Feed (US equities via GlobalStocksFeed / INX_EQ)
-# Separate socket from India MarketFeed; requires Global Stocks activated + dhanhq>=2.3.0rc1
-DHAN_US_LIVE_WEBSOCKET: bool = (
-    _env_bool("DHAN_US_LIVE_WEBSOCKET", "true") if DHAN_CONFIGURED else False
-)
 
 # Core India loop scans ONLY this list. Scout is optional (INDIA_SCOUT_ENABLED).
 # Single-universe (~50 names, no scout): copy india_scout.DEFAULT_INDIA_SCOUT_UNIVERSE
@@ -385,7 +380,7 @@ USE_MTF_FILTER: bool = _env_bool("USE_MTF_FILTER", "false")
 #   True  → strict regime→playbook map (RANGE=MR, TREND_UP=mom/pullback, TREND_DOWN=HOLD, OPEN_DRIVE=ORB only)
 #   False → kitchen-sink: try all playbooks ORB → Momentum → Pullback → MR (first BUY wins)
 USE_REGIME_FILTER: bool = _env_bool("USE_REGIME_FILTER", "true")
-# Separate market-wide SMA gate (RELIANCE/INTC vs SMA200). Blocks all BUYs in main when enabled.
+# Separate market-wide SMA gate (RELIANCE vs SMA200). Blocks all BUYs in main when enabled.
 # Not the same as USE_REGIME_FILTER (playbook selection).
 USE_MARKET_SMA_FILTER: bool = _env_bool("USE_MARKET_SMA_FILTER", "false")
 REGIME_SYMBOL_INDIA: str = os.getenv("REGIME_SYMBOL_INDIA", "RELIANCE").strip().upper()
@@ -434,81 +429,4 @@ def inter_symbol_fetch_gap_sec(gap_sec: float, index: int, n: int) -> float:
 
 # Dashboard SSE base-position refresh cadence (live prices still stream every ~1s).
 DASH_SSE_POS_REFRESH_SEC: int = _env_int("DASH_SSE_POS_REFRESH_SEC", "8")
-
-# ===========================================================================
-# US Market — Dhan Global Stocks
-# ===========================================================================
-# Separate live safety gate for US (independent from India):
-#   US_LIVE_TRADING=true + US_LIVE_CONFIRM=YES_REAL_MONEY
-US_LIVE_TRADING: bool = _env_bool("US_LIVE_TRADING", "false")
-US_LIVE_CONFIRM: str = os.getenv("US_LIVE_CONFIRM", "").strip()
-US_LIVE_CONFIRMED: bool = US_LIVE_TRADING and US_LIVE_CONFIRM == "YES_REAL_MONEY"
-
-# Paper sim: live Dhan US quotes, fake USD (no real global orders).
-# Forced OFF automatically when US_LIVE_CONFIRMED.
-_US_PAPER_ENV: bool = _env_bool("US_PAPER", "true")
-US_PAPER: bool = _US_PAPER_ENV and not US_LIVE_CONFIRMED
-
-# Paper starting cash — match current funded US wallet (raise when you deposit more).
-US_PAPER_STARTING_CASH: float = _env_float("US_PAPER_STARTING_CASH", "500")
-
-# Soft buying-power sleeve for US sizing + daily DD (cash Global Stocks, not MIS).
-# Keep at funded wallet size; bump to 1000 after the second $500 deposit.
-US_CAPITAL_CAP: float = _env_float("US_CAPITAL_CAP", "500")
-
-# US session gates (America/New_York). Do NOT reuse India IST ENTRY_CUTOFF.
-# NYSE RTH ends 16:00 ET; leave buffer before close (AVOID_CLOSE still applies).
-US_ENTRY_CUTOFF: str = os.getenv("US_ENTRY_CUTOFF", "15:15").strip()
-
-# US cash risk overrides (India MIS leverage must NOT apply here).
-US_RISK_PER_TRADE: float = _env_float("US_RISK_PER_TRADE", "0.01")  # 1% of sleeve (~$5 on $500)
-US_MAX_POSITION_PCT: float = _env_float("US_MAX_POSITION_PCT", "0.80")  # max 80% cash per name
-US_MAX_OPEN_POSITIONS: int = _env_int("US_MAX_OPEN_POSITIONS", "1")
-US_MAX_CLUSTER_POSITIONS: int = _env_int("US_MAX_CLUSTER_POSITIONS", "1")
-US_MAX_SHARES_PER_ORDER: int = _env_int("US_MAX_SHARES_PER_ORDER", "50")
-US_DAILY_DRAWDOWN_LIMIT: float = _env_float("US_DAILY_DRAWDOWN_LIMIT", "0.05")  # 5% of sleeve
-
-# US-only mis_regime filters (looser than India VWAP_STRETCH=1.5 / RSI=30).
-# Lower stretch_k → easier VWAP mean-reversion BUY; higher RSI_OVERSOLD → easier.
-US_VWAP_STRETCH_ATR: float = _env_float("US_VWAP_STRETCH_ATR", "0.70")
-US_RSI_OVERSOLD: float = _env_float("US_RSI_OVERSOLD", "42")
-US_EMA_EXTENSION_ATR: float = _env_float("US_EMA_EXTENSION_ATR", "1.20")
-US_VWAP_RECLAIM_BARS: int = _env_int("US_VWAP_RECLAIM_BARS", "1")
-
-# MIS bot: US off unless explicitly US_ENABLED=true
-US_ENABLED: bool = DHAN_CONFIGURED and _env_bool("US_ENABLED", "false")
-
-US_STOCK_UNIVERSE: list[str] = [
-    s.strip().upper()
-    for s in os.getenv(
-        "US_STOCK_UNIVERSE",
-        # Cheap/liquid names that fit whole shares on a ~$500 book
-        "INTC,F,BAC,T,PFE,SOFI,SNAP,WBD,HOOD,AMD",
-    ).split(",")
-    if s.strip()
-]
-
-US_CORRELATION_CLUSTERS: dict[str, list[str]] = {
-    "us_semi": ["INTC", "AMD"],
-    "us_banks": ["BAC"],
-    "us_telco_health": ["T", "PFE"],
-    "us_auto": ["F"],
-    "us_fintech_spec": ["SOFI", "HOOD"],
-    "us_media_tech": ["SNAP", "WBD"],
-}
-
-# Per-market strategy params (US)
-US_SMA_SLOW: int = _env_int("US_SMA_SLOW", str(SMA_SLOW))
-US_SMA_FAST: int = _env_int("US_SMA_FAST", str(SMA_FAST))
-US_EMA_PULLBACK: int = _env_int("US_EMA_PULLBACK", str(EMA_PULLBACK))
-US_RSI_PERIOD: int = _env_int("US_RSI_PERIOD", str(RSI_PERIOD))
-US_RSI_BUY: float = _env_float("US_RSI_BUY", str(RSI_BUY_THRESHOLD))
-US_RSI_SELL: float = _env_float("US_RSI_SELL", str(RSI_SELL_THRESHOLD))
-US_BB_STD: float = _env_float("US_BB_STD", str(BB_STD_DEV))
-# Slightly wider "range" band so VWAP_MR fires more often on US 5m
-US_ADX_RANGE_MAX: float = _env_float("US_ADX_RANGE_MAX", "32")
-
-REGIME_SYMBOL_US: str = os.getenv("REGIME_SYMBOL_US", "INTC").strip().upper()
-
-US_LOOP_INTERVAL_SEC: int = _env_int("US_LOOP_INTERVAL_SEC", "60")
 

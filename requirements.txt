@@ -8,9 +8,8 @@ flask>=3.0.0               # Web dashboard backend
 flask-cors>=4.0.0          # CORS for frontend API calls
 requests>=2.31.0           # Alerts + HTTP helpers
 
-# ── Indian & US Markets (DhanHQ for India + US Global Stocks) ──
-# 2.3.0rc1+ required for GlobalStocksFeed (US live WS). Install: pip install --pre -r requirements.txt
-dhanhq>=2.3.0rc1           # DhanHQ Python SDK (Global Stocks live feed)
+# ── Indian Markets (DhanHQ) ──
+dhanhq>=2.3.0rc1           # DhanHQ Python SDK
 smartapi-python>=1.3.0     # Angel One SmartAPI SDK (fallback)
 pyotp>=2.9.0               # TOTP for Dhan / Angel auto-login
 logzero>=1.7.0             # Logger dependency for SmartApi

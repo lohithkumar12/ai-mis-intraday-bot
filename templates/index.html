@@ -22,11 +22,8 @@
             </div>
 
             <div class="market-tabs">
-                <button class="tab-btn active" id="tab-india" onclick="switchMarket('INDIA')">
+                <button class="tab-btn active" id="tab-india">
                     🇮🇳 India (NSE)
-                </button>
-                <button class="tab-btn" id="tab-us" onclick="switchMarket('US')">
-                    🇺🇸 US (Dhan Global)
                 </button>
             </div>
 
@@ -64,8 +61,8 @@
                     <div class="kpi-icon blue"><i class="fa-solid fa-wallet"></i></div>
                     <div class="kpi-info">
                         <span class="kpi-label" id="kpi-equity-label">Portfolio Equity</span>
-                        <h2 class="kpi-value" id="equity-val">$0.00</h2>
-                        <span class="kpi-sub" id="equity-sub">Prev: $0.00</span>
+                        <h2 class="kpi-value" id="equity-val">₹0.00</h2>
+                        <span class="kpi-sub" id="equity-sub">Prev: ₹0.00</span>
                     </div>
                 </div>
 
@@ -73,7 +70,7 @@
                     <div class="kpi-icon" id="pl-icon-bg"><i class="fa-solid fa-chart-line" id="pl-icon"></i></div>
                     <div class="kpi-info">
                         <span class="kpi-label" id="kpi-pl-label">Today's P&L</span>
-                        <h2 class="kpi-value" id="daily-pl-val">$0.00</h2>
+                        <h2 class="kpi-value" id="daily-pl-val">₹0.00</h2>
                         <span class="kpi-badge" id="daily-pl-pct">0.00%</span>
                     </div>
                 </div>
@@ -82,8 +79,8 @@
                     <div class="kpi-icon green"><i class="fa-solid fa-bolt"></i></div>
                     <div class="kpi-info">
                         <span class="kpi-label" id="kpi-bp-label">Buying Power</span>
-                        <h2 class="kpi-value" id="buying-power-val">$0.00</h2>
-                        <span class="kpi-sub" id="cash-val">Cash: $0.00</span>
+                        <h2 class="kpi-value" id="buying-power-val">₹0.00</h2>
+                        <span class="kpi-sub" id="cash-val">Cash: ₹0.00</span>
                     </div>
                 </div>
 
@@ -197,10 +194,6 @@
                     <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px;">
                         <span style="font-size: 0.8em; opacity: 0.7;">WebSocket Feed</span>
                         <h4 style="margin: 5px 0;" id="segment-ws-status"><i class="fa-solid fa-wifi"></i> Live Streaming</h4>
-                    </div>
-                    <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px;">
-                        <span style="font-size: 0.8em; opacity: 0.7;">US Global Feed</span>
-                        <h4 style="margin: 5px 0;" id="segment-us-ws-status"><i class="fa-solid fa-wifi"></i> US Feed</h4>
                     </div>
                     <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px;">
                         <span style="font-size: 0.8em; opacity: 0.7;">Product Mode</span>

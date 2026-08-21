@@ -42,30 +42,13 @@ def _round_px(market: str, price: float, mode: str = "nearest") -> float:
 
 
 class RiskManager:
-    def __init__(self, market: str = "US"):
+    def __init__(self, market: str = "INDIA"):
         self.market = market.upper()
-        if self.market == "US":
-            self.risk_per_trade = float(
-                getattr(config, "US_RISK_PER_TRADE", config.RISK_PER_TRADE)
-            )
-            self.max_position_pct = float(
-                getattr(config, "US_MAX_POSITION_PCT", 0.80)
-            )
-            self.daily_drawdown_limit = float(
-                getattr(config, "US_DAILY_DRAWDOWN_LIMIT", config.DAILY_DRAWDOWN_LIMIT)
-            )
-            self.max_open_positions = int(
-                getattr(config, "US_MAX_OPEN_POSITIONS", 1)
-            )
-            self.max_cluster_positions = int(
-                getattr(config, "US_MAX_CLUSTER_POSITIONS", 1)
-            )
-        else:
-            self.risk_per_trade = config.RISK_PER_TRADE
-            self.max_position_pct = config.MAX_POSITION_PCT
-            self.daily_drawdown_limit = config.DAILY_DRAWDOWN_LIMIT
-            self.max_open_positions = config.MAX_OPEN_POSITIONS
-            self.max_cluster_positions = config.MAX_CLUSTER_POSITIONS
+        self.risk_per_trade = config.RISK_PER_TRADE
+        self.max_position_pct = config.MAX_POSITION_PCT
+        self.daily_drawdown_limit = config.DAILY_DRAWDOWN_LIMIT
+        self.max_open_positions = config.MAX_OPEN_POSITIONS
+        self.max_cluster_positions = config.MAX_CLUSTER_POSITIONS
         self.atr_stop_mult = config.ATR_STOP_MULT
         self.atr_trail_mult = config.ATR_TRAIL_MULT
         self.take_profit_r = config.TAKE_PROFIT_R
@@ -82,12 +65,9 @@ class RiskManager:
         self._margin_by_symbol: dict[str, float] = {}
         self._entry_lock = threading.RLock()
 
-        clusters = (
-            config.INDIA_CORRELATION_CLUSTERS
-            if self.market == "INDIA"
-            else config.US_CORRELATION_CLUSTERS
+        self._clusters = (
+            config.INDIA_CORRELATION_CLUSTERS if self.market == "INDIA" else {}
         )
-        self._clusters = clusters
 
         logger.info(
             f"RiskManager[{self.market}] — "
@@ -114,14 +94,12 @@ class RiskManager:
         return journal.expanduser().resolve().parent / f"{self.market.lower()}_trade_state.json"
 
     # -----------------------------------------------------------------------
-    # Capital sleeve (INDIA_CAPITAL_CAP / US_CAPITAL_CAP)
+    # India capital sleeve
     # -----------------------------------------------------------------------
     def capital_cap(self) -> float:
         """Return market capital cap when set; else 0 (no sleeve)."""
         if self.market == "INDIA":
             return float(getattr(config, "INDIA_CAPITAL_CAP", 0) or 0)
-        if self.market == "US":
-            return float(getattr(config, "US_CAPITAL_CAP", 0) or 0)
         return 0.0
 
     def effective_equity(self, equity: float) -> float:
@@ -181,12 +159,7 @@ class RiskManager:
             logger.warning("Invalid equity/price for sizing — 0 shares.")
             return 0
 
-        if self.market == "US":
-            max_shares = int(
-                getattr(config, "US_MAX_SHARES_PER_ORDER", 50) or 50
-            )
-        else:
-            max_shares = int(getattr(config, "MAX_SHARES_PER_ORDER", 500) or 500)
+        max_shares = int(getattr(config, "MAX_SHARES_PER_ORDER", 500) or 500)
         stop = float(stop_distance or 0)
         min_stop_pct = float(getattr(config, "MIN_STOP_PCT", 0.0) or 0.0)
         if min_stop_pct > 0 and price > 0:
@@ -666,8 +639,8 @@ class RiskManager:
     def is_tradable_session(
         self,
         now: datetime | None = None,
-        market_open_hm: tuple[int, int] = (9, 30),
-        market_close_hm: tuple[int, int] = (16, 0),
+        market_open_hm: tuple[int, int] = (9, 15),
+        market_close_hm: tuple[int, int] = (15, 30),
     ) -> bool:
         """
         Returns False during first/last AVOID_* minutes unless ALLOW_OPEN_CLOSE_WINDOW.
@@ -680,7 +653,7 @@ class RiskManager:
                 now = datetime.now()
             if self._past_entry_cutoff(now):
                 cut = self._entry_cutoff_str()
-                label = "US_ENTRY_CUTOFF" if self.market == "US" else "ENTRY_CUTOFF"
+                label = "ENTRY_CUTOFF"
                 logger.info(f"[{self.market}] Skipping — past {label}={cut}")
                 return False
             return True
@@ -706,14 +679,12 @@ class RiskManager:
             return False
         if self._past_entry_cutoff(now):
             cut = self._entry_cutoff_str()
-            label = "US_ENTRY_CUTOFF" if self.market == "US" else "ENTRY_CUTOFF"
+            label = "ENTRY_CUTOFF"
             logger.info(f"[{self.market}] Skipping — past {label}={cut}")
             return False
         return True
 
     def _entry_cutoff_str(self) -> str:
-        if self.market == "US":
-            return str(getattr(config, "US_ENTRY_CUTOFF", "") or "").strip()
         return str(getattr(config, "ENTRY_CUTOFF", "") or "").strip()
 
     def _past_entry_cutoff(self, now: datetime) -> bool:

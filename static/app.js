@@ -1,8 +1,8 @@
 /* ==========================================================================
-   AI Quant Trading Dashboard — Frontend Logic (India + US Market Support)
+   AI Quant Trading Dashboard — Frontend Logic (India Only)
    ========================================================================== */
 
-let activeMarket = "INDIA"; // "INDIA" or "US"
+const activeMarket = "INDIA"
 let liveGeneration = 0;
 let scannerGeneration = 0;
 let liveAbort = null;
@@ -51,7 +51,7 @@ function beginScannerFetch() {
 }
 
 function currentFormatter() {
-    return activeMarket === "US" ? formatUSD : formatINR;
+    return formatINR;
 }
 
 /* ---------- SSE Live Stream ---------- */
@@ -167,39 +167,6 @@ function updateLiveIndicator(streaming) {
     }
 }
 
-function switchMarket(market) {
-    if (activeMarket === market) return;
-    activeMarket = market;
-
-    // Update tab styling
-    document.getElementById("tab-india").classList.toggle("active", market === "INDIA");
-    document.getElementById("tab-us").classList.toggle("active", market === "US");
-
-    // Update headers and universe label
-    const headerSub = document.getElementById("header-sub");
-    const univSub = document.getElementById("kpi-universe-sub");
-    const scannerTitle = document.getElementById("scanner-title");
-    const scoutPanel = document.getElementById("scout-panel");
-
-    if (market === "US") {
-        if (headerSub) headerSub.textContent = "US Trading Engine (Dhan Global)";
-        if (univSub) univSub.textContent = "Universe: US Equities (Dhan Global)";
-        if (scannerTitle) scannerTitle.innerHTML = `<i class="fa-solid fa-radar"></i> Strategy Scanner (US Equities)`;
-        if (scoutPanel) scoutPanel.style.display = "none";
-    } else {
-        if (headerSub) headerSub.textContent = "India Trading Engine";
-        if (univSub) univSub.textContent = "Universe: Nifty Large-Caps (Dhan / NSE)";
-        if (scannerTitle) scannerTitle.innerHTML = `<i class="fa-solid fa-radar"></i> Strategy Scanner (NSE)`;
-        if (scoutPanel) scoutPanel.style.display = "";
-        fetchScoutData();
-    }
-
-    clearMarketPanels();
-    // Reconnect SSE for new market
-    connectLiveStream();
-    fetchScannerData();
-    fetchTrades();
-}
 
 function clearMarketPanels() {
     document.getElementById("equity-val").textContent = "—";
@@ -251,11 +218,10 @@ function fetchScannerData() {
 function fetchCurrentTabData() {
     fetchLiveData();
     fetchScannerData();
-    if (activeMarket === "INDIA") fetchScoutData();
+    fetchScoutData();
 }
 
 async function fetchScoutData() {
-    if (activeMarket !== "INDIA") return;
     const tbody = document.getElementById("scout-tbody");
     const hint = document.getElementById("scout-hint");
     if (!tbody) return;
@@ -311,8 +277,8 @@ function updateScoutUI(data) {
 }
 
 async function fetchLive(gen, signal) {
-    const statusUrl = activeMarket === "US" ? '/api/us/status' : '/api/status';
-    const posUrl = activeMarket === "US" ? '/api/us/positions' : '/api/positions';
+    const statusUrl = '/api/status';
+    const posUrl = '/api/positions';
     const fmt = currentFormatter();
 
     try {
@@ -331,7 +297,7 @@ async function fetchLive(gen, signal) {
             }
             updateStatusUI(status);
         } else {
-            renderDisabledState(activeMarket === "US" ? "Set DHAN_* keys & US_PAPER=true" : "Add Dhan / Angel keys in environment");
+            renderDisabledState("Add Dhan / Angel keys in environment");
         }
 
         if (positionsRes.ok) {
@@ -342,12 +308,12 @@ async function fetchLive(gen, signal) {
     } catch (err) {
         if (err.name === 'AbortError' || isLiveStale(gen)) return;
         console.error("Error fetching live data:", err);
-        renderDisabledState(activeMarket === "US" ? "Set DHAN_* keys & US_PAPER=true" : "Add Dhan / Angel keys in environment");
+        renderDisabledState("Add Dhan / Angel keys in environment");
     }
 }
 
 async function fetchScanner(gen, signal) {
-    const scannerUrl = activeMarket === "US" ? '/api/us/scanner' : '/api/scanner';
+    const scannerUrl = '/api/scanner';
     const fmt = currentFormatter();
 
     try {
@@ -386,7 +352,7 @@ function updateStatusUI(data) {
 
     const fmt = currentFormatter();
     document.getElementById("equity-val").textContent = fmt(data.equity);
-    document.getElementById("equity-sub").textContent = activeMarket === "US" ? "Dhan Global Account (USD)" : "India Broker Account (INR)";
+    document.getElementById("equity-sub").textContent = "India Broker Account (INR)";
 
     const dailyPlEl = document.getElementById("daily-pl-val");
     const dailyPctEl = document.getElementById("daily-pl-pct");
@@ -399,36 +365,31 @@ function updateStatusUI(data) {
 
     document.getElementById("buying-power-val").textContent = fmt(data.available_cash);
     document.getElementById("cash-val").textContent = data.paper_trading
-        ? `Paper sim (live ${activeMarket === "US" ? "US" : "NSE"} prices)`
+        ? "Paper sim (live NSE prices)"
         : `Margin Used: ${fmt(data.used_margin || 0)}`;
 
     const modeText = document.getElementById("mode-text");
     if (modeText) {
-        if (activeMarket === "US") {
-            modeText.textContent = data.paper_trading
-                ? "US Paper (live USD)"
-                : (data.live_armed ? "US LIVE MONEY" : "US SCAN only");
-        } else {
             modeText.textContent = data.paper_trading
                 ? "India Paper (live NSE)"
                 : (data.live_armed ? "India LIVE MONEY" : "India SCAN only");
-        }
+
     }
 
     const marketStatusEl = document.getElementById("market-status");
     const marketBadge = document.getElementById("market-badge");
     if (data.market_open) {
-        marketStatusEl.textContent = activeMarket === "US" ? "NYSE Open" : "NSE India Open";
+        marketStatusEl.textContent = "NSE India Open";
         marketBadge.style.color = "var(--success)";
         marketBadge.style.background = "var(--success-bg)";
     } else {
-        marketStatusEl.textContent = activeMarket === "US" ? "NYSE Closed" : "NSE India Closed";
+        marketStatusEl.textContent = "NSE India Closed";
         marketBadge.style.color = "var(--warning)";
         marketBadge.style.background = "var(--warning-bg)";
     }
 
     updateKillSwitchBadge(!!data.kill_switch_active);
-    if (modeText && data.tide_bearish && activeMarket !== "US") {
+    if (modeText && data.tide_bearish) {
         modeText.textContent = `${modeText.textContent} · TIDE LOCK`;
     }
     const freshnessEl = document.getElementById("freshness-text");
@@ -446,7 +407,7 @@ function updateStatusUI(data) {
 }
 
 function renderDisabledState(msg) {
-    const zero = activeMarket === "US" ? "$0.00" : "₹0.00";
+    const zero = "₹0.00";
     document.getElementById("equity-val").textContent = `${activeMarket} Pending`;
     document.getElementById("equity-sub").textContent = msg || "Check credentials in environment";
     document.getElementById("daily-pl-val").textContent = zero;
@@ -535,13 +496,6 @@ function updateScannerUI(scannerList, formatter) {
                     </div>
                     ${item.reason ? `<div class="ind-row"><span>Why:</span><span class="ind-val" style="font-size:0.75rem;">${item.reason}</span></div>` : ''}
                 </div>
-                ${activeMarket === "US" ? `
-                <div style="margin-top: 10px; text-align: right;">
-                    <button class="btn btn-buy btn-sm" onclick="buyStock('${item.symbol}')">
-                        <i class="fa-solid fa-cart-shopping"></i> Buy
-                    </button>
-                </div>
-                ` : ''}
             </div>
         `;
     });
@@ -549,25 +503,6 @@ function updateScannerUI(scannerList, formatter) {
     container.innerHTML = cardsHtml;
 }
 
-async function buyStock(symbol) {
-    if (activeMarket !== "US") {
-        alert("Manual buy from scanner is available on the US tab.");
-        return;
-    }
-    if (!confirm(`Place BUY order for ${symbol}? (Risk manager will size position)`)) return;
-    try {
-        const res = await fetch('/api/us/buy', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ symbol })
-        });
-        const data = await res.json();
-        alert(data.message);
-        fetchCurrentTabData();
-    } catch (e) {
-        alert("Failed to place buy order: " + e);
-    }
-}
 
 async function fetchLogs() {
     try {
@@ -633,9 +568,8 @@ async function fetchHealth() {
         if (!res.ok) return;
         const h = await res.json();
         const inAge = h.india_cycle_age_sec != null ? `${Math.round(h.india_cycle_age_sec)}s` : '—';
-        const usAge = h.us_cycle_age_sec != null ? `${Math.round(h.us_cycle_age_sec)}s` : '—';
-        el.textContent = `IN ${inAge} | US ${usAge}`;
-        if (h.india_last_error || h.us_last_error) {
+            el.textContent = `INDIA ${inAge}`;
+        if (h.india_last_error) {
             el.textContent += ' | err';
             el.style.color = 'var(--warning)';
         } else {
@@ -648,12 +582,12 @@ async function fetchHealth() {
 
 async function closePosition(symbol) {
     if (!confirm(`Close position for ${symbol}?`)) return;
-    const url = activeMarket === "US" ? `/api/us/close_position/${symbol}` : `/api/close_position/${symbol}`;
+    const url = `/api/close_position/${symbol}`;
     try {
         const res = await fetch(url, { method: 'POST' });
         const data = await res.json();
         if (data.status === "success" && data.pnl != null) {
-            const fmt = activeMarket === "US" ? formatUSD : formatINR;
+            const fmt = formatINR;
             alert(
                 `${data.message}\n` +
                 `Entry ${fmt(data.entry_price)} → Exit ${fmt(data.exit_price)}\n` +
@@ -670,7 +604,7 @@ async function closePosition(symbol) {
 }
 
 async function toggleKillSwitch() {
-    const url = activeMarket === "US" ? '/api/us/toggle_kill_switch' : '/api/toggle_kill_switch';
+    const url = '/api/toggle_kill_switch';
     try {
         const res = await fetch(url, { method: 'POST' });
         const data = await res.json();
@@ -681,10 +615,6 @@ async function toggleKillSwitch() {
     }
 }
 
-function formatUSD(val) {
-    if (val == null || isNaN(val)) return "$0.00";
-    return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val);
-}
 
 function formatINR(val) {
     if (val == null || isNaN(val)) return "₹0.00";
@@ -697,7 +627,6 @@ async function fetchSegmentsStatus() {
         if (!res.ok) return;
         const data = await res.json();
         const wsEl = document.getElementById("segment-ws-status");
-        const usWsEl = document.getElementById("segment-us-ws-status");
         const prodEl = document.getElementById("segment-product-type");
         const fnoEl = document.getElementById("segment-fno-status");
         const mcxEl = document.getElementById("segment-mcx-status");
@@ -711,20 +640,6 @@ async function fetchSegmentsStatus() {
             wsEl.innerHTML = isConn
                 ? `<i class="fa-solid fa-wifi" style="color: #4ade80;"></i> Connected (${sub} sym, ${age}s)`
                 : `<i class="fa-solid fa-wifi" style="color: #f87171;"></i> REST Fallback`;
-        }
-        if (usWsEl) {
-            const usFeed = data.dhan_us_live_feed || (data.segments && data.segments.us_global && data.segments.us_global.live_feed) || {};
-            const isConn = usFeed.connected;
-            const age = usFeed.last_heartbeat_age_sec;
-            const sub = usFeed.subscribed_count != null ? usFeed.subscribed_count : "?";
-            const mode = usFeed.mode || "off";
-            if (!usFeed.enabled && mode === "rest_yahoo_fallback") {
-                usWsEl.innerHTML = `<i class="fa-solid fa-wifi" style="color: #94a3b8;"></i> Off (Yahoo/REST)`;
-            } else if (isConn) {
-                usWsEl.innerHTML = `<i class="fa-solid fa-wifi" style="color: #4ade80;"></i> US Live (${sub} sym, ${age}s)`;
-            } else {
-                usWsEl.innerHTML = `<i class="fa-solid fa-wifi" style="color: #fbbf24;"></i> US ${mode}`;
-            }
         }
         if (prodEl && data.product_type) {
             prodEl.textContent = data.product_type + " Mode";

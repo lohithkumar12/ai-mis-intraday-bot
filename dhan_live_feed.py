@@ -679,8 +679,4 @@ class DhanLiveFeedManager:
                 "order_updates_received": len(self._order_updates),
                 "reconnect_attempts": self._reconnect_attempts,
                 "last_error": self._last_error or None,
-                "us_feed_note": (
-                    "US Global uses separate GlobalStocksFeed "
-                    "(see dhan_us_live_feed / DHAN_US_LIVE_WEBSOCKET)"
-                ),
             }

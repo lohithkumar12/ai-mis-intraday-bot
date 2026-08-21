@@ -35,16 +35,12 @@ def is_uptrend_df(df: Optional[pd.DataFrame], sma_len: int = 200) -> bool:
 def market_sma_allows(market: str, bar_cache: dict) -> bool:
     """
     Optional market-wide SMA gate (USE_MARKET_SMA_FILTER).
-    When enabled, blocks new BUYs if REGIME_SYMBOL_* is below SMA_SLOW.
+    When enabled, blocks new BUYs if REGIME_SYMBOL_INDIA is below SMA_SLOW.
     Independent of USE_REGIME_FILTER (mis_regime playbook selection).
     """
     if not getattr(config, "USE_MARKET_SMA_FILTER", False):
         return True
-    symbol = (
-        config.REGIME_SYMBOL_US
-        if market.upper() == "US"
-        else config.REGIME_SYMBOL_INDIA
-    )
+    symbol = config.REGIME_SYMBOL_INDIA
     df = bar_cache.get(symbol)
     ok = is_uptrend_df(df, config.SMA_SLOW)
     if not ok:

@@ -22,7 +22,7 @@ Selectable via config.STRATEGY_NAME:
 
   D) mean_reversion / regime_adaptive / breakout — same as New_StartUp
 
-Same interface for India (and US if enabled); params from market-specific config.
+India strategy interface with India-specific configuration.
 """
 
 from __future__ import annotations
@@ -165,38 +165,19 @@ def _ist_tz():
         return pytz.timezone("Asia/Kolkata")
 
 
-def _et_tz():
-    try:
-        from zoneinfo import ZoneInfo
-
-        return ZoneInfo("America/New_York")
-    except ImportError:
-        import pytz  # type: ignore
-
-        return pytz.timezone("America/New_York")
-
 
 def now_ist() -> datetime:
     return datetime.now(_ist_tz())
 
 
-def now_et() -> datetime:
-    return datetime.now(_et_tz())
 
-
-def market_now(market: str) -> datetime:
-    """Local clock for the given market (IST for India, ET for US)."""
-    if str(market or "").upper() == "US":
-        return now_et()
+def market_now(market: str = "INDIA") -> datetime:
+    """India market clock (IST)."""
     return now_ist()
 
-
-def entry_cutoff_for_market(market: str) -> str:
-    """HH:MM cutoff string for the market's local clock."""
-    if str(market or "").upper() == "US":
-        return str(getattr(config, "US_ENTRY_CUTOFF", "") or "").strip()
+def entry_cutoff_for_market(market: str = "INDIA") -> str:
+    """India entry cutoff in HH:MM IST."""
     return str(getattr(config, "ENTRY_CUTOFF", "") or "").strip()
-
 
 def timeframe_minutes() -> int:
     raw = str(getattr(config, "TIMEFRAME", "5") or "5").strip().lower()
@@ -260,7 +241,7 @@ def calc_session_vwap(
 
     Resets each calendar session. Pre-open bars are NaN.
     A RangeIndex (tests) is treated as a single session using every row.
-    tz defaults to Asia/Kolkata; pass America/New_York for US.
+    tz defaults to Asia/Kolkata.
     """
     if df is None or df.empty:
         return pd.Series(dtype=float)
@@ -308,16 +289,13 @@ def in_open_drive_window(
     *,
     market: str = "INDIA",
 ) -> bool:
-    """True during session open drive window (IST 09:15 / US ET 09:30)."""
+    """True during the India session open-drive window (09:15 IST)."""
     if now is None:
         now = market_now(market)
     if window_minutes is None:
         window_minutes = int(getattr(config, "ORB_WINDOW_MINUTES", 60) or 60)
     mins = now.hour * 60 + now.minute
-    if str(market or "").upper() == "US":
-        open_m = 9 * 60 + 30
-    else:
-        open_m = 9 * 60 + 15
+    open_m = 9 * 60 + 15
     return open_m <= mins < open_m + int(window_minutes)
 
 
@@ -330,7 +308,6 @@ def past_entry_cutoff(
     """
     True when local time >= entry cutoff (HH:MM). No new BUYs after this.
 
-    For US, pass market="US" (or cutoff=US_ENTRY_CUTOFF) and an ET `now`.
     India defaults: IST now + ENTRY_CUTOFF.
     """
     raw = cutoff
@@ -380,49 +357,33 @@ class MarketParams:
     adx_period: int = 14
     volume_avg_period: int = 20
     confirm_bars: int = 2
-    market: str = "US"
+    market: str = "INDIA"
 
 
 def params_for_market(market: str) -> MarketParams:
-    m = market.upper()
-    if m == "INDIA":
-        return MarketParams(
-            sma_slow=config.INDIA_SMA_SLOW,
-            sma_fast=config.INDIA_SMA_FAST,
-            ema_pullback=config.INDIA_EMA_PULLBACK,
-            rsi_period=config.INDIA_RSI_PERIOD,
-            rsi_buy=config.INDIA_RSI_BUY,
-            rsi_sell=config.INDIA_RSI_SELL,
-            bb_std=config.INDIA_BB_STD,
-            adx_range_max=config.INDIA_ADX_RANGE_MAX,
-            atr_period=config.ATR_PERIOD,
-            adx_period=config.ADX_PERIOD,
-            volume_avg_period=config.VOLUME_AVG_PERIOD,
-            confirm_bars=config.CONFIRM_BARS,
-            market="INDIA",
-        )
+    if str(market or "").upper() != "INDIA":
+        raise ValueError(f"Unsupported market {market!r}; this bot is India-only")
     return MarketParams(
-        sma_slow=config.US_SMA_SLOW,
-        sma_fast=config.US_SMA_FAST,
-        ema_pullback=config.US_EMA_PULLBACK,
-        rsi_period=config.US_RSI_PERIOD,
-        rsi_buy=config.US_RSI_BUY,
-        rsi_sell=config.US_RSI_SELL,
-        bb_std=config.US_BB_STD,
-        adx_range_max=config.US_ADX_RANGE_MAX,
+        sma_slow=config.INDIA_SMA_SLOW,
+        sma_fast=config.INDIA_SMA_FAST,
+        ema_pullback=config.INDIA_EMA_PULLBACK,
+        rsi_period=config.INDIA_RSI_PERIOD,
+        rsi_buy=config.INDIA_RSI_BUY,
+        rsi_sell=config.INDIA_RSI_SELL,
+        bb_std=config.INDIA_BB_STD,
+        adx_range_max=config.INDIA_ADX_RANGE_MAX,
         atr_period=config.ATR_PERIOD,
         adx_period=config.ADX_PERIOD,
         volume_avg_period=config.VOLUME_AVG_PERIOD,
         confirm_bars=config.CONFIRM_BARS,
-        market="US",
+        market="INDIA",
     )
-
 
 # ---------------------------------------------------------------------------
 # Base interface
 # ---------------------------------------------------------------------------
 class BaseStrategy(ABC):
-    """Shared strategy contract for US and India loops."""
+    """Shared contract for India trading strategies."""
 
     name: str = "base"
 
@@ -1368,10 +1329,7 @@ class MisRegimeStrategy(BaseStrategy):
         return "BUY", f"close>{prior_high:.2f} vol_ok rs_leader"
 
     def _is_extended(self, close: float, vwap: float, ema, atr) -> bool:
-        if self.p.market == "US":
-            k = float(getattr(config, "US_EMA_EXTENSION_ATR", 1.2) or 1.2)
-        else:
-            k = float(getattr(config, "EMA_EXTENSION_ATR", 1.0) or 1.0)
+        k = float(getattr(config, "EMA_EXTENSION_ATR", 1.0) or 1.0)
         if atr is None or pd.isna(atr) or float(atr) <= 0:
             return False
         atr_f = float(atr)
@@ -1429,14 +1387,9 @@ class MisRegimeStrategy(BaseStrategy):
             return "HOLD", f"adx={adx:.1f}_not_range"
         if atr <= 0:
             return "HOLD", "atr_invalid"
-        if self.p.market == "US":
-            stretch_k = float(getattr(config, "US_VWAP_STRETCH_ATR", 0.7) or 0.7)
-            rsi_os = float(getattr(config, "US_RSI_OVERSOLD", 42) or 42)
-            reclaim_n = max(1, int(getattr(config, "US_VWAP_RECLAIM_BARS", 1) or 1))
-        else:
-            stretch_k = float(getattr(config, "VWAP_STRETCH_ATR", 1.0) or 1.0)
-            rsi_os = float(getattr(config, "RSI_OVERSOLD", 30) or 30)
-            reclaim_n = max(1, int(getattr(config, "VWAP_RECLAIM_BARS", 1) or 1))
+        stretch_k = float(getattr(config, "VWAP_STRETCH_ATR", 1.0) or 1.0)
+        rsi_os = float(getattr(config, "RSI_OVERSOLD", 30) or 30)
+        reclaim_n = max(1, int(getattr(config, "VWAP_RECLAIM_BARS", 1) or 1))
         threshold = vwap - stretch_k * atr
         if close > threshold:
             return "HOLD", f"weak_stretch close={close:.2f} > {threshold:.2f}"
@@ -1502,12 +1455,7 @@ class MisRegimeStrategy(BaseStrategy):
         if "ADX" not in df.columns or "VOL_AVG" not in df.columns:
             df = self.compute_indicators(df)
 
-        if market == "US":
-            vwap_series = calc_session_vwap(
-                df, session_open_hm=(9, 30), tz=_et_tz()
-            )
-        else:
-            vwap_series = calc_session_vwap(df)
+        vwap_series = calc_session_vwap(df)
         vwap_raw = vwap_series.iloc[-1] if len(vwap_series) else np.nan
         if vwap_raw is None or pd.isna(vwap_raw) or float(vwap_raw) <= 0:
             return self._record(symbol, PLAYBOOK_NONE, PLAYBOOK_NONE, "HOLD", "no_session_vwap", [])
@@ -1523,7 +1471,7 @@ class MisRegimeStrategy(BaseStrategy):
             return sig
 
         if past_entry_cutoff(now, market=market, cutoff=cutoff_raw):
-            label = "US_ENTRY_CUTOFF" if market == "US" else "ENTRY_CUTOFF"
+            label = "ENTRY_CUTOFF"
             return self._record(
                 symbol,
                 regime,
@@ -1829,7 +1777,7 @@ class FilteredStrategy(BaseStrategy):
 # Factory
 # ---------------------------------------------------------------------------
 def create_strategy(
-    market: str = "US",
+    market: str = "INDIA",
     name: str | None = None,
     rs_filter: RelativeStrengthFilter | None = None,
 ) -> BaseStrategy:
@@ -1837,7 +1785,7 @@ def create_strategy(
     Build the configured strategy for a market.
 
     Args:
-        market: "US" or "INDIA"
+        market: "INDIA"
         name: override STRATEGY_NAME
         rs_filter: optional shared RS filter instance
     """
@@ -1867,7 +1815,10 @@ def create_strategy(
     if strategy_name in _MIS_REGIME_NAMES:
         return base
 
-    use_rs = config.USE_RELATIVE_STRENGTH or rs_filter is not None
+    # Callers that enable the overlay pass their shared filter explicitly.
+    # Keeping factory-only construction unwrapped preserves concrete strategy
+    # types for dashboard/tests and avoids hidden behavior from local .env.
+    use_rs = rs_filter is not None
     if use_rs:
         filt = rs_filter or RelativeStrengthFilter()
         return FilteredStrategy(base, filt)
@@ -1876,9 +1827,9 @@ def create_strategy(
 
 # Backward-compatible alias used by older imports / dashboard
 class Strategy(TrendPullbackStrategy):
-    """Legacy name — uses US params + configured STRATEGY_NAME via factory preferred."""
+    """Legacy India strategy wrapper; factory usage is preferred."""
 
-    def __init__(self, market: str = "US"):
+    def __init__(self, market: str = "INDIA"):
         # Delegate construction through factory so STRATEGY_NAME is honored
         built = create_strategy(market=market)
         # Copy state for isinstance-compat callers that expect Strategy()

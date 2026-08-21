@@ -85,7 +85,7 @@ def synthetic_bars(n: int = 400, seed: int = 42) -> pd.DataFrame:
 def run_backtest(
     df: pd.DataFrame,
     strategy_name: str,
-    market: str = "US",
+    market: str = "INDIA",
     symbol: str = "SYM",
     initial_equity: float = 100_000.0,
     risk_per_trade: float | None = None,
