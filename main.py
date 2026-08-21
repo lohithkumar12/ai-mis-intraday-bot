@@ -175,7 +175,7 @@ def _india_try_buy(
         logger.info(f"{symbol}: BUY skipped — outside tradable session window")
         return False
     if not regime_ok:
-        logger.info(f"{symbol}: BUY skipped — regime filter blocked entries")
+        logger.info(f"{symbol}: BUY skipped — market SMA filter blocked entries")
         return False
     if risk_mgr.is_kill_switch_active:
         logger.info(f"{symbol}: BUY skipped — kill switch active")
@@ -1469,7 +1469,7 @@ def run_us_loop(strategy, risk_mgr, rs_filter=None):
                         logger.info(f"[US] {symbol}: BUY skipped — outside tradable session")
                         continue
                     if not regime_ok:
-                        logger.info(f"[US] {symbol}: BUY skipped — regime filter blocked")
+                        logger.info(f"[US] {symbol}: BUY skipped — market SMA filter blocked")
                         continue
                     if not risk_mgr.is_position_allowed(symbol, current_positions):
                         continue

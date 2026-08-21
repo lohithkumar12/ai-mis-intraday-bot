@@ -381,9 +381,13 @@ BUY_RESERVE_TTL_SEC: float = _env_float("BUY_RESERVE_TTL_SEC", "45")
 
 # Multi-timeframe / regime — softer defaults for MIS ORB (optional)
 USE_MTF_FILTER: bool = _env_bool("USE_MTF_FILTER", "false")
-# RELIANCE SMA-200 overlay removed. Per-stock mis_regime + Nifty/BankNifty tide remain.
-# Env USE_REGIME_FILTER is ignored so a leftover true on the VM cannot block all buys.
-USE_REGIME_FILTER: bool = False
+# mis_regime playbook gating (MisRegimeStrategy.generate_signal):
+#   True  → strict regime→playbook map (RANGE=MR, TREND_UP=mom/pullback, TREND_DOWN=HOLD, OPEN_DRIVE=ORB only)
+#   False → kitchen-sink: try all playbooks ORB → Momentum → Pullback → MR (first BUY wins)
+USE_REGIME_FILTER: bool = _env_bool("USE_REGIME_FILTER", "true")
+# Separate market-wide SMA gate (RELIANCE/INTC vs SMA200). Blocks all BUYs in main when enabled.
+# Not the same as USE_REGIME_FILTER (playbook selection).
+USE_MARKET_SMA_FILTER: bool = _env_bool("USE_MARKET_SMA_FILTER", "false")
 REGIME_SYMBOL_INDIA: str = os.getenv("REGIME_SYMBOL_INDIA", "RELIANCE").strip().upper()
 
 # Nifty / BankNifty 5m "tide" circuit breaker — blocks new longs only (no flatten)

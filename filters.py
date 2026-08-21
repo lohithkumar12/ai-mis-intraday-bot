@@ -32,8 +32,13 @@ def is_uptrend_df(df: Optional[pd.DataFrame], sma_len: int = 200) -> bool:
     return float(close.iloc[-1]) > float(last_sma)
 
 
-def regime_allows(market: str, bar_cache: dict) -> bool:
-    if not config.USE_REGIME_FILTER:
+def market_sma_allows(market: str, bar_cache: dict) -> bool:
+    """
+    Optional market-wide SMA gate (USE_MARKET_SMA_FILTER).
+    When enabled, blocks new BUYs if REGIME_SYMBOL_* is below SMA_SLOW.
+    Independent of USE_REGIME_FILTER (mis_regime playbook selection).
+    """
+    if not getattr(config, "USE_MARKET_SMA_FILTER", False):
         return True
     symbol = (
         config.REGIME_SYMBOL_US
@@ -43,8 +48,15 @@ def regime_allows(market: str, bar_cache: dict) -> bool:
     df = bar_cache.get(symbol)
     ok = is_uptrend_df(df, config.SMA_SLOW)
     if not ok:
-        logger.info(f"[{market}] Regime filter blocked entries — {symbol} below SMA{config.SMA_SLOW}")
+        logger.info(
+            f"[{market}] Market SMA filter blocked entries — "
+            f"{symbol} below SMA{config.SMA_SLOW}"
+        )
     return ok
+
+
+# Back-compat alias used by main.py
+regime_allows = market_sma_allows
 
 
 def mtf_allows(symbol: str, daily_df: Optional[pd.DataFrame]) -> bool:

@@ -72,12 +72,21 @@ docker compose logs -f bot
 
 Regime selector — **not** OR-combined signals. For each symbol and each cycle, **at most one** playbook may BUY (hard XOR). First qualifier wins; later playbooks are not executed. If none qualify → HOLD. Sitting out is valid.
 
-| Regime | When | Playbook |
+Controlled by **`USE_REGIME_FILTER`** (default `true` — regime-first discipline):
+
+| `USE_REGIME_FILTER` | Behavior |
+|---------------------|----------|
+| `true` | Strict regime→playbook (table below). `OPEN_DRIVE` is **ORB only** (no momentum/pullback fallback). `TREND_DOWN` → HOLD. |
+| `false` | Kitchen-sink scanner: ignore regime for selection; try **ORB → VWAP_MOMENTUM_RS → EMA_PULLBACK → VWAP_MEAN_REVERSION**. First BUY wins. ORB SELL only if `ORB_ALLOW_SHORT=true` (all-playbooks mode only; strict mode never shorts). |
+
+| Regime (when filter=`true`) | When | Playbook |
 |--------|------|----------|
-| `OPEN_DRIVE` | `09:15 ≤ t < 09:15 + ORB_WINDOW_MINUTES` **and** expansion (`ADX` rising over `ADX_RISING_LOOKBACK` **or** bar range ≥ `RANGE_EXPANSION_MULT` × recent mean range) | Improved ORB first. If ORB fails → **HOLD** unless `TREND_UP` is independently true (then VWAP momentum / EMA pullback). **No** fall-through to mean reversion. After the first filled ORB, **one** continuation BUY is allowed (any regime except cutoff) if the latest completed 5m close is ≥ **0.5%** above the prior 5m high **and** its volume is **greater** than the first ORB trigger candle. Weaker volume keeps the HOLD lock. |
+| `OPEN_DRIVE` | `09:15 ≤ t < 09:15 + ORB_WINDOW_MINUTES` **and** expansion (`ADX` rising over `ADX_RISING_LOOKBACK` **or** bar range ≥ `RANGE_EXPANSION_MULT` × recent mean range) | Improved ORB only. If ORB fails → **HOLD**. After the first filled ORB, **one** continuation BUY is allowed (any regime except cutoff) if the latest completed 5m close is ≥ **0.5%** above the prior 5m high **and** its volume is **greater** than the first ORB trigger candle. Weaker volume keeps the HOLD lock. |
 | `TREND_UP` | `ADX ≥ ADX_RANGE_MAX` and close > session VWAP and trend confirmed (optional HTF EMA via `ORB_USE_HTF_FILTER`) | 1) VWAP + momentum + **own** RS top-`RS_TOP_N` 2) EMA pullback + momentum. Extended price → HOLD. |
 | `RANGE` | `ADX < ADX_RANGE_MAX` | VWAP mean reversion only (stretch + RSI oversold + reclaim). No ORB / momentum chase. |
-| `TREND_DOWN` | `ADX ≥ ADX_RANGE_MAX` and close < VWAP and momentum falling | **HOLD** (long-only). `ORB_ALLOW_SHORT` stays false unless the caller enables it later. |
+| `TREND_DOWN` | `ADX ≥ ADX_RANGE_MAX` and close < VWAP and momentum falling | **HOLD** (long-only). |
+
+**Market SMA gate (separate):** `USE_MARKET_SMA_FILTER` blocks all BUYs when `REGIME_SYMBOL_INDIA`/`US` is below SMA200. Do not confuse with `USE_REGIME_FILTER`.
 
 **Completed 5-minute bars only** — the forming candle is never used for a decision (same `completed_bars_only` rule as ORB). Session VWAP is cumulative typical-price×volume from today's 09:15 IST completed bars.
 
@@ -91,6 +100,8 @@ Regime selector — **not** OR-combined signals. For each symbol and each cycle,
 
 | Env | Default | Role |
 |-----|---------|------|
+| `USE_REGIME_FILTER` | true | Strict regime→playbook (`true`) vs kitchen-sink all playbooks (`false`) |
+| `USE_MARKET_SMA_FILTER` | false | Block all BUYs when regime symbol below SMA200 |
 | `ORB_WINDOW_MINUTES` | 60 | OPEN_DRIVE clock window |
 | `ORB_CONTINUATION_ENABLED` | true | Allow one second ORB BUY after day-fired |
 | `ORB_CONTINUATION_BREAK_PCT` | 0.005 | Min close extension above prior 5m high (0.5%) |

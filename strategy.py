@@ -1118,20 +1118,18 @@ class OpeningRangeBreakoutStrategy(BaseStrategy):
 class MisRegimeStrategy(BaseStrategy):
     """
     Regime-based MIS selector. Hard XOR: at most one playbook may BUY
-    per symbol per cycle. First qualifier wins; later playbooks are not
-    executed for that symbol.
+    (or ORB SELL when shorts are enabled) per symbol per cycle.
 
-    Precedence (explicit):
-      1. OPEN_DRIVE + Improved ORB
-         ORB qualifies → BUY and stop.
-         ORB fails → HOLD by default. Do NOT fall through to RANGE / MR.
-         TREND_UP playbooks run only when TREND_UP is independently true.
-      2. TREND_UP + VWAP momentum + RS
-      3. TREND_UP + EMA pullback + momentum
-      4. RANGE + VWAP mean reversion
-      5. HOLD
+    USE_REGIME_FILTER=True (strict regime→playbook):
+      OPEN_DRIVE  → IMPROVED_ORB only (no momentum/pullback fallback)
+      TREND_UP    → VWAP_MOMENTUM_RS then EMA_PULLBACK
+      RANGE       → VWAP_MEAN_REVERSION only
+      TREND_DOWN  → HOLD (trend_down_no_shorts)
 
-    TREND_DOWN → HOLD (long-only; ORB_ALLOW_SHORT stays caller-controlled).
+    USE_REGIME_FILTER=False (all playbooks, ignore regime for selection):
+      Order: ORB → VWAP_MOMENTUM_RS → EMA_PULLBACK → VWAP_MEAN_REVERSION
+      First BUY wins. ORB SELL is returned only when ORB_ALLOW_SHORT=True.
+
     Uses completed 5-minute bars only. No Dhan/order calls.
     """
 
@@ -1166,11 +1164,12 @@ class MisRegimeStrategy(BaseStrategy):
         self._rs = RelativeStrengthFilter()
         self.last_decision: dict = {}
         self.last_orb_continuation = False
+        use_rf = bool(getattr(config, "USE_REGIME_FILTER", True))
         logger.info(
             f"[{params.market}] MisRegime | window={self.orb_window}m "
             f"confirm={self.confirm_bars} vol_mult={self.volume_mult} "
-            f"adx_range={params.adx_range_max} XOR precedence="
-            f"ORB > VWAP_MOMENTUM_RS > EMA_PULLBACK > VWAP_MR"
+            f"adx_range={params.adx_range_max} USE_REGIME_FILTER={use_rf} "
+            f"XOR={'strict-regime' if use_rf else 'ORB>MOM>PULLBACK>MR'}"
         )
 
     def update_universe(self, symbol_dfs: dict) -> None:
@@ -1320,13 +1319,19 @@ class MisRegimeStrategy(BaseStrategy):
             return REGIME_TREND_DOWN, f"adx={adx:.1f} close<vwap mixed"
         return REGIME_TREND_UP, f"adx={adx:.1f} close>vwap unconfirmed_htf"
 
-    def _playbook_orb(self, df: pd.DataFrame, symbol: str) -> tuple[str, str]:
+    def _playbook_orb(
+        self, df: pd.DataFrame, symbol: str, *, allow_short: bool | None = None
+    ) -> tuple[str, str]:
         sig = self._orb.generate_signal(df, symbol)
         if sig == "BUY":
             if getattr(self._orb, "last_orb_continuation", False):
                 return "BUY", "orb_continuation"
             return "BUY", "orb_breakout"
         if sig == "SELL":
+            if allow_short is None:
+                allow_short = bool(getattr(config, "ORB_ALLOW_SHORT", False))
+            if allow_short:
+                return "SELL", "orb_short_breakout"
             return "HOLD", "orb_sell_ignored_long_only"
         return "HOLD", "orb_no_setup"
 
@@ -1540,10 +1545,12 @@ class MisRegimeStrategy(BaseStrategy):
         adx_raw = latest.get("ADX")
         adx = float(adx_raw) if adx_raw is not None and not pd.isna(adx_raw) else 0.0
         trend_up_ok = self._trend_up_clear(close, vwap, adx, df)
+        # True → strict regime→playbook; False → kitchen-sink all playbooks.
+        use_regime_filter = bool(getattr(config, "USE_REGIME_FILTER", True))
 
         # Second ORB may fire after OPEN_DRIVE if day-fired + 0.5%/volume continuation.
         if self.has_day_fired(symbol, "BUY"):
-            orb_pair = self._playbook_orb(df, symbol)
+            orb_pair = self._playbook_orb(df, symbol, allow_short=False)
             if (
                 orb_pair[0] == "BUY"
                 and getattr(self._orb, "last_orb_continuation", False)
@@ -1560,27 +1567,28 @@ class MisRegimeStrategy(BaseStrategy):
                     orb_continuation=True,
                 )
 
-        # ---- 1. OPEN_DRIVE + Improved ORB ----
-        if regime == REGIME_OPEN_DRIVE:
-            if eval_one(PLAYBOOK_ORB, self._playbook_orb(df, symbol)) == "BUY":
+        # ---- USE_REGIME_FILTER=False: kitchen-sink (all playbooks, fixed XOR order) ----
+        # Order: ORB → Momentum → Pullback → MR. First BUY wins.
+        # ORB SELL only here, and only when ORB_ALLOW_SHORT=True (strict mode never shorts).
+        if not use_regime_filter:
+            allow_short = bool(getattr(config, "ORB_ALLOW_SHORT", False))
+            orb_pair = self._playbook_orb(df, symbol, allow_short=allow_short)
+            if eval_one(PLAYBOOK_ORB, orb_pair) == "BUY":
                 return self._record(
                     symbol, regime, PLAYBOOK_ORB, "BUY",
-                    f"{regime_why}; orb", evaluations, ts=ts,
+                    f"all_playbooks_orb ({regime_why})", evaluations, ts=ts,
                 )
-            # ORB failed: HOLD unless TREND_UP is independently and clearly true.
-            # Do not fall through to RANGE / mean-reversion in the same cycle.
-            if not trend_up_ok:
+            if allow_short and orb_pair[0] == "SELL":
                 return self._record(
-                    symbol, regime, PLAYBOOK_NONE, "HOLD",
-                    f"open_drive_orb_fail_no_trend_up_fallback ({regime_why})",
-                    evaluations, ts=ts,
+                    symbol, regime, PLAYBOOK_ORB, "SELL",
+                    f"all_playbooks_orb_short ({regime_why})", evaluations, ts=ts,
                 )
             if eval_one(
                 PLAYBOOK_MOMENTUM, self._playbook_vwap_momentum_rs(df, symbol, vwap)
             ) == "BUY":
                 return self._record(
                     symbol, regime, PLAYBOOK_MOMENTUM, "BUY",
-                    "open_drive_fallback_trend_up_momentum", evaluations, ts=ts,
+                    f"all_playbooks_momentum ({regime_why})", evaluations, ts=ts,
                 )
             if eval_one(
                 PLAYBOOK_PULLBACK,
@@ -1588,14 +1596,37 @@ class MisRegimeStrategy(BaseStrategy):
             ) == "BUY":
                 return self._record(
                     symbol, regime, PLAYBOOK_PULLBACK, "BUY",
-                    "open_drive_fallback_trend_up_pullback", evaluations, ts=ts,
+                    f"all_playbooks_pullback ({regime_why})", evaluations, ts=ts,
+                )
+            if eval_one(
+                PLAYBOOK_MR, self._playbook_vwap_mr(df, symbol, vwap)
+            ) == "BUY":
+                return self._record(
+                    symbol, regime, PLAYBOOK_MR, "BUY",
+                    f"all_playbooks_mr ({regime_why})", evaluations, ts=ts,
                 )
             return self._record(
                 symbol, regime, PLAYBOOK_NONE, "HOLD",
-                "open_drive_orb_fail_trend_up_playbooks_hold", evaluations, ts=ts,
+                f"all_playbooks_none ({regime_why})", evaluations, ts=ts,
             )
 
-        # ---- 2/3. TREND_UP playbooks (XOR: momentum then pullback) ----
+        # ---- USE_REGIME_FILTER=True: strict regime→playbook mapping ----
+        # OPEN_DRIVE → ORB only (no momentum/pullback fallback).
+        if regime == REGIME_OPEN_DRIVE:
+            if eval_one(
+                PLAYBOOK_ORB, self._playbook_orb(df, symbol, allow_short=False)
+            ) == "BUY":
+                return self._record(
+                    symbol, regime, PLAYBOOK_ORB, "BUY",
+                    f"{regime_why}; orb", evaluations, ts=ts,
+                )
+            return self._record(
+                symbol, regime, PLAYBOOK_NONE, "HOLD",
+                f"open_drive_orb_only_fail ({regime_why})",
+                evaluations, ts=ts,
+            )
+
+        # TREND_UP → Momentum then Pullback (XOR).
         if regime == REGIME_TREND_UP:
             if not trend_up_ok:
                 return self._record(
@@ -1623,14 +1654,14 @@ class MisRegimeStrategy(BaseStrategy):
                 "trend_up_no_playbook", evaluations, ts=ts,
             )
 
-        # ---- TREND_DOWN: long-only → HOLD ----
+        # TREND_DOWN → no BUY (long-only when filter on).
         if regime == REGIME_TREND_DOWN:
             return self._record(
                 symbol, regime, PLAYBOOK_NONE, "HOLD",
                 f"trend_down_no_shorts ({regime_why})", evaluations, ts=ts,
             )
 
-        # ---- 4. RANGE + VWAP mean reversion only (no ORB / momentum chase) ----
+        # RANGE → VWAP mean reversion only.
         if regime == REGIME_RANGE:
             if eval_one(
                 PLAYBOOK_MR, self._playbook_vwap_mr(df, symbol, vwap)
